@@ -17,13 +17,18 @@ const path = require('path');
 const fs = require('fs');
 const crypto = require('crypto');
 const { spawn, execFile } = require('child_process');
+const os = require('os');
 
 // Base da API do Ecossistema (mesmo backend do /webdav validado no teste).
 const API_BASE = 'https://ecossistema-abel-production.up.railway.app/api';
 // Raiz do gateway WebDAV (lista as coleções que o usuário pode ver).
 const WEBDAV_URL = 'https://ecossistema-abel-production.up.railway.app/webdav';
-// Ponto de montagem no Windows (letra de drive).
-const MOUNT_POINT = 'Z:';
+
+const IS_MAC = process.platform === 'darwin';
+// Windows monta numa LETRA de drive; macOS (FUSE-T) monta numa PASTA.
+const MOUNT_POINT = IS_MAC ? path.join(os.homedir(), 'Abel Drive') : 'Z:';
+// Binário do rclone por plataforma (empacotado em bin/).
+const RCLONE_BIN = IS_MAC ? 'rclone' : 'rclone.exe';
 
 let mainWindow = null;
 let tray = null;
@@ -138,17 +143,24 @@ function toast(kind, text) {
   }
 }
 
-// Acha o rclone.exe: bin/ do projeto → recurso empacotado → PATH.
+// Acha o rclone: bin/ do projeto → recurso empacotado → PATH.
 function rclonePath() {
   const candidates = [
     process.env.ABEL_RCLONE,
-    path.join(__dirname, '..', 'bin', 'rclone.exe'),
-    path.join(process.resourcesPath || '', 'bin', 'rclone.exe'),
+    path.join(__dirname, '..', 'bin', RCLONE_BIN),
+    path.join(process.resourcesPath || '', 'bin', RCLONE_BIN),
   ].filter(Boolean);
   for (const c of candidates) {
     try { if (fs.existsSync(c)) return c; } catch (_) {}
   }
   return 'rclone'; // deixa o PATH resolver
+}
+
+// Abre o ponto de montagem no Explorer (Win) / Finder (Mac).
+function openMount() {
+  const mp = mountState.mountPoint;
+  if (!mp) return;
+  shell.openPath(IS_MAC ? mp : mp + '\\');
 }
 
 function confPath() { return path.join(app.getPath('userData'), 'rclone.conf'); }
@@ -254,10 +266,7 @@ function driveDisconnect() {
 ipcMain.handle('drive:connect', () => driveConnect());
 ipcMain.handle('drive:disconnect', () => driveDisconnect());
 ipcMain.handle('drive:status', () => mountState);
-ipcMain.handle('drive:open', () => {
-  if (mountState.mountPoint) shell.openPath(mountState.mountPoint + '\\');
-  return { ok: true };
-});
+ipcMain.handle('drive:open', () => { openMount(); return { ok: true }; });
 
 // ══════════════════════════════════════════════════════════════════════
 // BANDEJA (system tray) + auto-conectar + iniciar com o Windows
@@ -280,8 +289,8 @@ function buildTrayMenu() {
     { type: 'separator' },
     { label: 'Abrir o Abel Drive', click: showWindow },
     mounted
-      ? { label: 'Abrir no Explorer', click: () => shell.openPath((mountState.mountPoint || 'Z:') + '\\') }
-      : { label: 'Abrir no Explorer', enabled: false },
+      ? { label: IS_MAC ? 'Abrir no Finder' : 'Abrir no Explorer', click: openMount }
+      : { label: IS_MAC ? 'Abrir no Finder' : 'Abrir no Explorer', enabled: false },
     { type: 'separator' },
     mounted
       ? { label: 'Desconectar', click: () => driveDisconnect() }
