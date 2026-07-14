@@ -21,7 +21,7 @@
     "appId": "br.com.abeldesign.abeldrive",
     "productName": "Abel Drive",
     "publish": [
-      { "provider": "github", "owner": "SEU_USUARIO_GITHUB", "repo": "abel-drive" }
+      { "provider": "github", "owner": "AdmAbelDesign", "repo": "abel-drive" }
     ],
     "files": [
       "src/**/*",
