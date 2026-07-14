@@ -1,6 +1,6 @@
 {
   "name": "abel-drive",
-  "version": "0.1.0",
+  "version": "0.1.1",
   "description": "Abel Drive — acesso aos arquivos do Ecossistema Abel como um drive no computador.",
   "author": "Abel Design",
   "license": "UNLICENSED",
@@ -21,7 +21,7 @@
     "appId": "br.com.abeldesign.abeldrive",
     "productName": "Abel Drive",
     "publish": [
-      { "provider": "github", "owner": "AdmAbelDesign", "repo": "abel-drive" }
+      { "provider": "github", "owner": "AdmAbelDesign", "repo": "abel-drive", "releaseType": "release" }
     ],
     "files": [
       "src/**/*",

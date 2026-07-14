@@ -203,6 +203,11 @@ window.addEventListener('DOMContentLoaded', async () => {
   window.abel.onDriveState(renderDrive);
   window.abel.onDriveToast(showToast);
 
+  window.abel.version().then((v) => {
+    const el = $('app-version');
+    if (el) el.textContent = 'Abel Drive · v' + v;
+  });
+
   // Se já houver sessão guardada, pula direto para a tela conectado.
   const st = await window.abel.getState();
   if (st.hasSession && st.profile) {

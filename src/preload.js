@@ -7,6 +7,7 @@ const { contextBridge, ipcRenderer } = require('electron');
 
 contextBridge.exposeInMainWorld('abel', {
   getState:    ()               => ipcRenderer.invoke('app:getState'),
+  version:     ()               => ipcRenderer.invoke('app:version'),
   identify:    (email)          => ipcRenderer.invoke('auth:identify', email),
   requestPin:  (email, companyId) => ipcRenderer.invoke('auth:requestPin', { email, companyId }),
   verifyPin:   (email, pin, totp) => ipcRenderer.invoke('auth:verifyPin', { email, pin, totp }),

@@ -84,6 +84,8 @@ ipcMain.handle('app:getState', () => {
   return { hasSession: !!s.session_id, profile: s.profile || null };
 });
 
+ipcMain.handle('app:version', () => app.getVersion());
+
 ipcMain.handle('auth:identify', async (_e, email) => {
   return api('/auth/identify', { body: { email } });
 });
