@@ -25,10 +25,21 @@ const API_BASE = 'https://ecossistema-abel-production.up.railway.app/api';
 const WEBDAV_URL = 'https://ecossistema-abel-production.up.railway.app/webdav';
 
 const IS_MAC = process.platform === 'darwin';
-// Windows monta numa LETRA de drive; macOS (FUSE-T) monta numa PASTA.
-const MOUNT_POINT = IS_MAC ? path.join(os.homedir(), 'Abel Drive') : 'Z:';
 // Binário do rclone por plataforma (empacotado em bin/).
 const RCLONE_BIN = IS_MAC ? 'rclone' : 'rclone.exe';
+
+// Ponto de montagem. Mac (FUSE-T): a PASTA ~/Abel Drive. Windows: a primeira
+// LETRA de drive LIVRE (resolvida ao conectar). Antes era fixo em Z:, o que
+// quebraria se o usuário já tivesse Z: ocupado.
+function pickWindowsDriveLetter() {
+  for (const L of ['Z', 'Y', 'X', 'W', 'V', 'U', 'T', 'S', 'R', 'Q', 'P', 'O', 'N', 'M']) {
+    try { if (!fs.existsSync(L + ':\\')) return L + ':'; } catch (_) {}
+  }
+  return 'Z:';
+}
+function resolveMountPoint() {
+  return IS_MAC ? path.join(os.homedir(), 'Abel Drive') : pickWindowsDriveLetter();
+}
 
 let mainWindow = null;
 let tray = null;
@@ -119,7 +130,7 @@ ipcMain.handle('auth:setProfile', (_e, profile) => {
 
 ipcMain.handle('auth:logout', async () => {
   try { await api('/auth/logout', { withSession: true }); } catch (_) {}
-  writeStore({ session_id: null, profile: null });
+  writeStore({ session_id: null, profile: null, cred_secret: null, cred_expires: null });
   return { ok: true };
 });
 
@@ -163,6 +174,50 @@ function openMount() {
   shell.openPath(IS_MAC ? mp : mp + '\\');
 }
 
+// ── WinFsp (driver que o rclone precisa pra montar drive no Windows) ────
+// No Mac o equivalente é o FUSE-T (instalado à parte pelo usuário).
+function winfspInstalled() {
+  if (IS_MAC) return true;
+  try {
+    // A chave de registro do WinFsp existe quando ele está instalado.
+    require('child_process').execFileSync(
+      'reg', ['query', 'HKLM\\SOFTWARE\\WOW6432Node\\WinFsp', '/v', 'InstallDir'],
+      { stdio: 'ignore' }
+    );
+    return true;
+  } catch (_) { return false; }
+}
+
+function winfspInstallerPath() {
+  const cands = [
+    path.join(__dirname, '..', 'bin', 'winfsp.msi'),
+    path.join(process.resourcesPath || '', 'bin', 'winfsp.msi'),
+  ];
+  for (const c of cands) { try { if (fs.existsSync(c)) return c; } catch (_) {} }
+  return null;
+}
+
+// Roda o instalador do WinFsp ELEVADO (UAC aparece uma vez). Só necessário
+// numa máquina que ainda não tem o driver.
+function runWinfspInstaller(msi) {
+  return new Promise((resolve) => {
+    const ps = "Start-Process msiexec -ArgumentList '/i','\"" + msi + "\"','/passive','/norestart' -Verb RunAs -Wait";
+    execFile('powershell', ['-NoProfile', '-Command', ps], { windowsHide: true }, (err) => resolve(!err));
+  });
+}
+
+// Garante o WinFsp antes de montar. Se faltar e tivermos o instalador embutido,
+// instala (com UAC). Se faltar e não tiver embutido, orienta o usuário.
+async function ensureWinFsp() {
+  if (winfspInstalled()) return { ok: true };
+  const msi = winfspInstallerPath();
+  if (!msi) return { ok: false, error: 'Falta o WinFsp. Instale-o em winfsp.dev e conecte de novo.' };
+  setMount({ status: 'connecting', message: 'Instalando o WinFsp (permita a alteração)…' });
+  await runWinfspInstaller(msi);
+  if (!winfspInstalled()) return { ok: false, error: 'A instalação do WinFsp não concluiu. Tente de novo.' };
+  return { ok: true };
+}
+
 function confPath() { return path.join(app.getPath('userData'), 'rclone.conf'); }
 
 // O rclone guarda a senha OBSCURECIDA (não em texto puro). Rodamos
@@ -199,40 +254,66 @@ function handleRcloneLog(text) {
   }
 }
 
-async function driveConnect() {
-  if (rcloneProc) return mountState;
-  setMount({ status: 'connecting', message: 'Pegando sua credencial…' });
-
+// Reusa a credencial guardada se ainda válida (folga de 7 dias); senão gera
+// uma nova e guarda. Evita criar uma credencial a cada "Conectar".
+async function getCredentialSecret() {
+  const s = readStore();
+  if (s.cred_secret && s.cred_expires) {
+    const exp = new Date(s.cred_expires).getTime();
+    if (isFinite(exp) && exp - Date.now() > 7 * 24 * 60 * 60 * 1000) {
+      return { ok: true, secret: s.cred_secret, reused: true };
+    }
+  }
   const cred = await api('/mountain-duck/credentials', {
     method: 'POST', body: { label: 'Abel Drive' }, withSession: true,
   });
   if (!cred.ok || !cred.data || !cred.data.secret) {
-    setMount({ status: 'error', message: 'Não consegui gerar a credencial (' + (cred.error || 'erro') + ').' });
+    return { ok: false, error: cred.error || 'erro' };
+  }
+  const expires = cred.data.credential && cred.data.credential.expires_at;
+  writeStore({ cred_secret: cred.data.secret, cred_expires: expires || null });
+  return { ok: true, secret: cred.data.secret, reused: false };
+}
+
+async function driveConnect() {
+  if (rcloneProc) return mountState;
+  setMount({ status: 'connecting', message: 'Pegando sua credencial…' });
+
+  const c = await getCredentialSecret();
+  if (!c.ok) {
+    setMount({ status: 'error', message: 'Não consegui a credencial (' + c.error + ').' });
     return mountState;
   }
 
-  let obscured;
-  try {
-    obscured = await rcloneObscure(cred.data.secret);
-  } catch (e) {
-    setMount({ status: 'error', message: 'rclone não encontrado. Coloque o rclone.exe na pasta bin do app.' });
-    return mountState;
+  // Só (re)escreve o rclone.conf quando a credencial é nova ou o conf sumiu.
+  if (!c.reused || !fs.existsSync(confPath())) {
+    let obscured;
+    try {
+      obscured = await rcloneObscure(c.secret);
+    } catch (e) {
+      setMount({ status: 'error', message: 'rclone não encontrado. Coloque o rclone na pasta bin do app.' });
+      return mountState;
+    }
+    writeRcloneConf(obscured);
   }
-  writeRcloneConf(obscured);
+
+  // Garante o WinFsp (Windows). Na 1ª vez, numa máquina sem o driver, instala.
+  const wf = await ensureWinFsp();
+  if (!wf.ok) { setMount({ status: 'error', message: wf.error }); return mountState; }
 
   setMount({ status: 'connecting', message: 'Montando o drive…' });
-  // Cache PRÓPRIO do app (isolado do rclone manual, evita colisão de cache
-  // entre remotes de mesmo nome apontando para caminhos diferentes).
+  const mountPoint = resolveMountPoint();
+  // Cache PRÓPRIO do app (isolado do rclone manual, evita colisão de cache).
   const cacheDir = path.join(app.getPath('userData'), 'rclone-cache');
   try { fs.mkdirSync(cacheDir, { recursive: true }); } catch (_) {}
   const args = [
-    'mount', 'abel:', MOUNT_POINT,
+    'mount', 'abel:', mountPoint,
     '--config', confPath(),
     '--cache-dir', cacheDir,
     '--vfs-cache-mode', 'full',
     '--vfs-cache-max-age', '24h',      // mantém o baixado por 24h (reabrir rápido)
     '--vfs-fast-fingerprint',          // fingerprint por mtime+tamanho (INDD grande)
-    '--dir-cache-time', '1m',          // era 10s (teste) → 1min: navegação bem mais leve
+    '--dir-cache-time', '1m',          // navegação mais leve
     '--attr-timeout', '3s',
     '--volname', 'Abel Drive',
   ];
@@ -246,14 +327,20 @@ async function driveConnect() {
   rcloneProc.on('exit', (code) => {
     const wasIntentional = mountState.status === 'disconnecting';
     rcloneProc = null;
-    if (wasIntentional) setMount({ status: 'idle', mountPoint: null, message: '' });
-    else setMount({ status: 'error', mountPoint: null, message: 'O drive desconectou (código ' + code + ').' });
+    if (wasIntentional) {
+      setMount({ status: 'idle', mountPoint: null, message: '' });
+    } else {
+      // Pode ter sido credencial inválida/revogada — descarta a guardada pra
+      // gerar uma nova na próxima tentativa (rede de segurança do reúso).
+      writeStore({ cred_secret: null, cred_expires: null });
+      setMount({ status: 'error', mountPoint: null, message: 'O drive desconectou (código ' + code + ').' });
+    }
   });
 
   // O mount não "termina" — fica rodando. Depois de alguns segundos sem crash,
   // consideramos montado.
   setTimeout(() => {
-    if (rcloneProc) setMount({ status: 'mounted', mountPoint: MOUNT_POINT, message: 'Conectado' });
+    if (rcloneProc) setMount({ status: 'mounted', mountPoint, message: 'Conectado' });
   }, 3500);
 
   return mountState;
