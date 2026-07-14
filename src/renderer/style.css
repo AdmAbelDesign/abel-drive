@@ -242,6 +242,37 @@ input.pin {
 .toast.error { background: #fff0f2; color: #b3243c; border-left: 3px solid var(--abel-red); }
 .toast.info  { background: #eef3fb; color: #2f5296; border-left: 3px solid var(--abel-blue); }
 
+/* ── atualização ───────────────────────────────────────────────────── */
+.update-box {
+  background: var(--bg-soft);
+  border: 1px solid var(--border);
+  border-radius: 10px;
+  padding: 12px 14px;
+  margin: 14px 0 8px;
+  text-align: center;
+}
+.update-msg {
+  display: block;
+  font-size: 12.5px;
+  color: var(--text-secondary);
+  margin-bottom: 10px;
+}
+.update-box.err .update-msg { color: #b3243c; }
+.update-box.ready .update-msg { color: #6c9c14; font-weight: 700; }
+.update-link {
+  display: block;
+  width: 100%;
+  background: transparent;
+  border: none;
+  font-family: inherit;
+  font-size: 11px;
+  color: var(--text-muted);
+  cursor: pointer;
+  padding: 6px;
+  margin-top: 4px;
+}
+.update-link:hover { color: var(--abel-vinho); }
+
 /* utilidades */
 .hidden { display: none !important; }
 .footer-note {

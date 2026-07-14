@@ -321,20 +321,50 @@ function createTray() {
   refreshTray();
 }
 
-// Auto-update (só na versão instalada). require preguiçoso: em dev (npm start)
-// o electron-updater pode nem estar instalado — não quebra.
-function initAutoUpdate() {
-  if (!app.isPackaged) return;
-  let autoUpdater;
-  try { autoUpdater = require('electron-updater').autoUpdater; }
-  catch (_) { return; }
-  autoUpdater.autoDownload = true;
-  autoUpdater.autoInstallOnAppQuit = true;
-  autoUpdater.on('update-available', () => toast('info', 'Baixando uma atualização do Abel Drive…'));
-  autoUpdater.on('update-downloaded', () => toast('info', 'Atualização pronta — será aplicada ao reiniciar o app.'));
-  autoUpdater.on('error', (e) => console.error('[update]', e && (e.message || e)));
-  autoUpdater.checkForUpdates().catch(() => {});
+// ── Auto-update visível (status ao vivo + verificar manual + reiniciar) ──
+let updateState = { status: 'idle', version: null, message: '' };
+function setUpdate(patch) {
+  updateState = { ...updateState, ...patch };
+  if (mainWindow && !mainWindow.isDestroyed()) {
+    mainWindow.webContents.send('update:state', updateState);
+  }
 }
+
+let _updater = null;
+function getUpdater() {
+  if (_updater) return _updater;
+  try { _updater = require('electron-updater').autoUpdater; }
+  catch (_) { return null; }
+  _updater.autoDownload = true;
+  _updater.autoInstallOnAppQuit = true;
+  _updater.on('checking-for-update', () => setUpdate({ status: 'checking', message: 'Procurando atualização…' }));
+  _updater.on('update-available', (i) => setUpdate({ status: 'downloading', version: i && i.version, message: 'Baixando a versão ' + (i && i.version) + '…' }));
+  _updater.on('download-progress', (p) => setUpdate({ status: 'downloading', message: 'Baixando… ' + Math.round(p.percent || 0) + '%' }));
+  _updater.on('update-not-available', () => setUpdate({ status: 'current', message: 'Você já está na versão mais recente.' }));
+  _updater.on('update-downloaded', (i) => setUpdate({ status: 'ready', version: i && i.version, message: 'Versão ' + (i && i.version) + ' pronta.' }));
+  _updater.on('error', (e) => setUpdate({ status: 'error', message: 'Erro ao atualizar: ' + String((e && (e.message || e)) || 'desconhecido').slice(0, 180) }));
+  return _updater;
+}
+
+function initAutoUpdate() {
+  if (!app.isPackaged) { setUpdate({ status: 'dev', message: 'Atualização só na versão instalada.' }); return; }
+  const u = getUpdater();
+  if (!u) { setUpdate({ status: 'error', message: 'Módulo de atualização indisponível.' }); return; }
+  u.checkForUpdates().catch(() => {});
+}
+
+ipcMain.handle('update:status', () => updateState);
+ipcMain.handle('update:check', () => {
+  if (!app.isPackaged) return { status: 'dev', message: 'Atualização só na versão instalada.' };
+  const u = getUpdater();
+  if (u) u.checkForUpdates().catch(() => {});
+  return updateState;
+});
+ipcMain.handle('update:install', () => {
+  const u = getUpdater();
+  if (u && updateState.status === 'ready') { isQuitting = true; u.quitAndInstall(); }
+  return { ok: true };
+});
 
 // Monta o drive sozinho ao abrir, se já houver sessão salva. Uma vez por
 // execução (o did-finish-load dispara também em reloads).

@@ -19,6 +19,12 @@ contextBridge.exposeInMainWorld('abel', {
   driveDisconnect: () => ipcRenderer.invoke('drive:disconnect'),
   driveStatus:     () => ipcRenderer.invoke('drive:status'),
   driveOpen:       () => ipcRenderer.invoke('drive:open'),
+
+  // Atualização
+  updateStatus:  () => ipcRenderer.invoke('update:status'),
+  updateCheck:   () => ipcRenderer.invoke('update:check'),
+  updateInstall: () => ipcRenderer.invoke('update:install'),
+  onUpdateState: (cb) => ipcRenderer.on('update:state', (_e, s) => cb(s)),
   onDriveState: (cb) => ipcRenderer.on('drive:state', (_e, s) => cb(s)),
   onDriveToast: (cb) => ipcRenderer.on('drive:toast', (_e, t) => cb(t)),
 });

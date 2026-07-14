@@ -178,6 +178,22 @@ function showToast(t) {
   toastTimer = setTimeout(() => { el.className = 'toast hidden'; }, 6000);
 }
 
+// ── Atualização ────────────────────────────────────────────────────────
+function renderUpdate(s) {
+  const box = $('update-box');
+  const st = (s && s.status) || 'idle';
+  const text = (s && s.message) || '';
+  const installBtn = $('btn-update-install');
+  if (!text || st === 'idle') {
+    box.className = 'update-box hidden';
+    installBtn.classList.add('hidden');
+    return;
+  }
+  box.className = 'update-box' + (st === 'error' ? ' err' : st === 'ready' ? ' ready' : '');
+  $('update-msg').textContent = text;
+  installBtn.classList.toggle('hidden', st !== 'ready');
+}
+
 function escapeHtml(s) {
   return String(s).replace(/[&<>"']/g, (c) => (
     { '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' }[c]
@@ -207,6 +223,11 @@ window.addEventListener('DOMContentLoaded', async () => {
     const el = $('app-version');
     if (el) el.textContent = 'Abel Drive · v' + v;
   });
+
+  $('btn-update-check').onclick = () => { window.abel.updateCheck().then(renderUpdate); };
+  $('btn-update-install').onclick = () => window.abel.updateInstall();
+  window.abel.onUpdateState(renderUpdate);
+  window.abel.updateStatus().then(renderUpdate);
 
   // Se já houver sessão guardada, pula direto para a tela conectado.
   const st = await window.abel.getState();
