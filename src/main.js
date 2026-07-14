@@ -230,7 +230,10 @@ async function driveConnect() {
     '--config', confPath(),
     '--cache-dir', cacheDir,
     '--vfs-cache-mode', 'full',
-    '--dir-cache-time', '10s',
+    '--vfs-cache-max-age', '24h',      // mantém o baixado por 24h (reabrir rápido)
+    '--vfs-fast-fingerprint',          // fingerprint por mtime+tamanho (INDD grande)
+    '--dir-cache-time', '1m',          // era 10s (teste) → 1min: navegação bem mais leve
+    '--attr-timeout', '3s',
     '--volname', 'Abel Drive',
   ];
   rcloneProc = spawn(rclonePath(), args, { windowsHide: true });
