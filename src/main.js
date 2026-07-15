@@ -12,12 +12,13 @@
 // O mount do rclone entra no M6a-2.
 // ══════════════════════════════════════════════════════════════════════
 
-const { app, BrowserWindow, ipcMain, shell, Tray, Menu, nativeImage } = require('electron');
+const { app, BrowserWindow, ipcMain, shell, Tray, Menu, nativeImage, dialog } = require('electron');
 const path = require('path');
 const fs = require('fs');
 const crypto = require('crypto');
 const { spawn, execFile } = require('child_process');
 const os = require('os');
+const net = require('net');
 
 // Base da API do Ecossistema (mesmo backend do /webdav validado no teste).
 const API_BASE = 'https://ecossistema-abel-production.up.railway.app/api';
@@ -141,6 +142,29 @@ ipcMain.handle('auth:logout', async () => {
 let rcloneProc = null;
 let mountState = { status: 'idle', mountPoint: null, message: '' };
 
+// ── RC (remote control) do rclone — usado SÓ para LER o progresso de sync ──
+// Escuta apenas em loopback (127.0.0.1), numa porta livre e com senha aleatória
+// gerada a cada conexão. Nada disso fica exposto pra fora da máquina. Lemos
+// vfs/stats (uploads na fila/em andamento) e core/stats (velocidade) para
+// mostrar "enviando…" e "tudo sincronizado".
+let rcAddr = null;           // '127.0.0.1:<porta>' resolvido a cada conexão
+let rcAuth = null;           // { user, pass } gerado a cada conexão
+let syncTimer = null;
+const SYNC_ZERO = { state: 'idle', pending: 0, transfers: 0, percent: null, speed: 0, errored: 0 };
+let syncState = { ...SYNC_ZERO };
+
+// Acha uma porta TCP livre no loopback (evita colisão com outro rclone/serviço).
+function getFreePort() {
+  return new Promise((resolve) => {
+    const srv = net.createServer();
+    srv.on('error', () => resolve(5579));
+    srv.listen(0, '127.0.0.1', () => {
+      const p = srv.address().port;
+      srv.close(() => resolve(p));
+    });
+  });
+}
+
 function setMount(patch) {
   mountState = { ...mountState, ...patch };
   if (mainWindow && !mainWindow.isDestroyed()) {
@@ -153,6 +177,194 @@ function toast(kind, text) {
     mainWindow.webContents.send('drive:toast', { kind, text });
   }
 }
+
+// ── progresso de sync (lido do RC do rclone) ───────────────────────────
+function setSync(patch) {
+  syncState = { ...syncState, ...patch };
+  if (mainWindow && !mainWindow.isDestroyed()) {
+    mainWindow.webContents.send('drive:sync', syncState);
+  }
+}
+
+// Chama um comando do RC do rclone (POST em loopback, Basic auth). Devolve o
+// JSON ou null (quando o RC ainda não subiu ou o mount caiu).
+async function rcCall(command) {
+  if (!rcAddr || !rcAuth) return null;
+  try {
+    const res = await fetch('http://' + rcAddr + '/' + command, {
+      method: 'POST',
+      headers: {
+        'Content-Type': 'application/json',
+        'Authorization': 'Basic ' + Buffer.from(rcAuth.user + ':' + rcAuth.pass).toString('base64'),
+      },
+      body: '{}',
+    });
+    return await res.json();
+  } catch (_) { return null; }
+}
+
+// Uma leitura do progresso: uploads pendentes (vfs/stats) + velocidade e % do
+// que está subindo agora (core/stats).
+async function pollSyncOnce() {
+  const [vfs, core] = await Promise.all([rcCall('vfs/stats'), rcCall('core/stats')]);
+  if (!vfs && !core) return; // RC ainda subindo — mantém o estado atual
+  const disk = (vfs && vfs.diskCache) || {};
+  const pending = Number(disk.uploadsInProgress || 0) + Number(disk.uploadsQueued || 0);
+  const transferring = (core && core.transferring) || [];
+  let sumBytes = 0, sumSize = 0;
+  for (const t of transferring) { sumBytes += Number(t.bytes || 0); sumSize += Number(t.size || 0); }
+  const percent = sumSize > 0 ? Math.min(100, Math.round((sumBytes / sumSize) * 100)) : null;
+  const uploading = pending > 0 || transferring.length > 0;
+  setSync({
+    state: uploading ? 'uploading' : 'synced',
+    pending,
+    transfers: transferring.length,
+    percent,
+    speed: Number((core && core.speed) || 0), // bytes/s
+    errored: Number(disk.erroredFiles || 0),
+  });
+}
+
+function startSyncPoll() {
+  stopSyncPoll();
+  pollSyncOnce();
+  syncTimer = setInterval(pollSyncOnce, 1500);
+}
+function stopSyncPoll() {
+  if (syncTimer) { clearInterval(syncTimer); syncTimer = null; }
+  setSync({ ...SYNC_ZERO });
+}
+
+// ══════════════════════════════════════════════════════════════════════
+// FIXAR PASTAS (pin) — mantém uma pasta sempre baixada no computador, pra
+// abrir instantâneo (o INDD + a pasta de imagens). Guardamos os caminhos
+// RELATIVOS ao drive (sobrevivem à troca de letra) e "pré-aquecemos" o cache
+// do rclone lendo os arquivos (com --vfs-cache-mode full, ler = baixar).
+// ══════════════════════════════════════════════════════════════════════
+
+let pinTimer = null;
+let pinWarm = { warming: false, done: 0, total: 0 };
+
+function cacheRootDir() { return path.join(app.getPath('userData'), 'rclone-cache'); }
+
+function emitPins() {
+  if (mainWindow && !mainWindow.isDestroyed()) {
+    mainWindow.webContents.send('drive:pins', { pins: readStore().pins || [], warm: pinWarm });
+  }
+}
+
+// Caminho RELATIVO ao ponto de montagem (sem a letra/raiz), com separador do SO.
+function relToMount(abs, mp) {
+  const norm = String(abs).replace(/[\\/]+$/, '');
+  if (norm.toLowerCase() === mp.toLowerCase()) return '';
+  if (!norm.toLowerCase().startsWith(mp.toLowerCase())) return null; // fora do drive
+  return norm.slice(mp.length).replace(/^[\\/]+/, '');
+}
+
+// Percorre a pasta (recursivo) e entrega cada arquivo.
+async function walkFiles(absDir, onFile) {
+  let entries;
+  try { entries = await fs.promises.readdir(absDir, { withFileTypes: true }); }
+  catch (_) { return; }
+  for (const ent of entries) {
+    if (!rcloneProc) return; // desmontou no meio
+    const p = path.join(absDir, ent.name);
+    if (ent.isDirectory()) await walkFiles(p, onFile);
+    else if (ent.isFile()) await onFile(p);
+  }
+}
+
+// Lê o arquivo inteiro pra puxar pro cache (descarta os bytes). Pula o que já
+// está cacheado (arquivo de cache com o mesmo tamanho) — re-aquecer fica barato.
+async function warmFile(abs, mp) {
+  try {
+    const st = await fs.promises.stat(abs);
+    if (!st.size) return;
+    const rel = relToMount(abs, mp);
+    if (rel == null) return;
+    const cachePath = path.join(cacheRootDir(), 'vfs', 'abel', ...rel.split(/[\\/]/));
+    try {
+      const cs = await fs.promises.stat(cachePath);
+      if (cs.size === st.size) return; // já em cache
+    } catch (_) {}
+    await new Promise((resolve) => {
+      const rs = fs.createReadStream(abs);
+      rs.on('data', () => {});
+      rs.on('end', resolve);
+      rs.on('error', resolve);
+    });
+  } catch (_) {}
+}
+
+// Pré-aquece todas as pastas fixas (uma passada). Idempotente e best-effort.
+async function warmPins() {
+  if (!rcloneProc || pinWarm.warming) return;
+  const mp = mountState.mountPoint;
+  if (!mp) return;
+  const pins = readStore().pins || [];
+  if (pins.length === 0) { pinWarm = { warming: false, done: 0, total: 0 }; emitPins(); return; }
+
+  pinWarm = { warming: true, done: 0, total: 0 };
+  emitPins();
+
+  const files = [];
+  for (const rel of pins) await walkFiles(path.join(mp, rel), async (f) => { files.push(f); });
+  pinWarm.total = files.length;
+  emitPins();
+
+  for (const f of files) {
+    if (!rcloneProc) break;
+    await warmFile(f, mp);
+    pinWarm.done++;
+    emitPins();
+  }
+  pinWarm = { warming: false, done: 0, total: 0 };
+  emitPins();
+}
+
+function startPinLoop() {
+  if (pinTimer) clearInterval(pinTimer);
+  // Re-aquece de tempos em tempos pra segurar o cache (antes do max-age de 24h).
+  pinTimer = setInterval(warmPins, 3 * 60 * 60 * 1000);
+}
+function stopPinLoop() {
+  if (pinTimer) { clearInterval(pinTimer); pinTimer = null; }
+  pinWarm = { warming: false, done: 0, total: 0 };
+}
+
+// Abre o seletor de pasta (dentro do drive) e fixa a escolhida.
+async function pinAdd() {
+  const mp = mountState.mountPoint;
+  if (!mp || mountState.status !== 'mounted') return { ok: false, error: 'Conecte o drive primeiro.' };
+  const r = await dialog.showOpenDialog(mainWindow, {
+    title: 'Escolha uma pasta do Abel Drive para deixar sempre no computador',
+    defaultPath: mp,
+    properties: ['openDirectory'],
+  });
+  if (r.canceled || !r.filePaths || !r.filePaths[0]) return { ok: true };
+  const rel = relToMount(r.filePaths[0], mp);
+  if (rel == null) return { ok: false, error: 'Escolha uma pasta de dentro do Abel Drive.' };
+  if (!rel) return { ok: false, error: 'Escolha uma subpasta (não a raiz do drive).' };
+  const pins = readStore().pins || [];
+  if (!pins.some((p) => p.toLowerCase() === rel.toLowerCase())) {
+    pins.push(rel);
+    writeStore({ pins });
+  }
+  emitPins();
+  warmPins();
+  return { ok: true, rel };
+}
+
+function pinRemove(rel) {
+  const pins = (readStore().pins || []).filter((p) => p.toLowerCase() !== String(rel).toLowerCase());
+  writeStore({ pins });
+  emitPins();
+  return { ok: true };
+}
+
+ipcMain.handle('pins:list', () => ({ pins: readStore().pins || [], warm: pinWarm }));
+ipcMain.handle('pins:add', () => pinAdd());
+ipcMain.handle('pins:remove', (_e, rel) => pinRemove(rel));
 
 // Acha o rclone: bin/ do projeto → recurso empacotado → PATH.
 function rclonePath() {
@@ -306,6 +518,10 @@ async function driveConnect() {
   // Cache PRÓPRIO do app (isolado do rclone manual, evita colisão de cache).
   const cacheDir = path.join(app.getPath('userData'), 'rclone-cache');
   try { fs.mkdirSync(cacheDir, { recursive: true }); } catch (_) {}
+  // RC em porta livre + senha aleatória (só pra LER o progresso de sync).
+  const rcPort = await getFreePort();
+  rcAddr = '127.0.0.1:' + rcPort;
+  rcAuth = { user: 'abel', pass: crypto.randomBytes(18).toString('hex') };
   const args = [
     'mount', 'abel:', mountPoint,
     '--config', confPath(),
@@ -316,6 +532,10 @@ async function driveConnect() {
     '--dir-cache-time', '1m',          // navegação mais leve
     '--attr-timeout', '3s',
     '--volname', 'Abel Drive',
+    '--rc',                            // liga o remote control (só leitura de stats)
+    '--rc-addr', rcAddr,
+    '--rc-user', rcAuth.user,
+    '--rc-pass', rcAuth.pass,
   ];
   rcloneProc = spawn(rclonePath(), args, { windowsHide: true });
   rcloneProc.stdout.on('data', handleRcloneLog);
@@ -327,6 +547,9 @@ async function driveConnect() {
   rcloneProc.on('exit', (code) => {
     const wasIntentional = mountState.status === 'disconnecting';
     rcloneProc = null;
+    stopSyncPoll();
+    stopPinLoop();
+    rcAddr = null; rcAuth = null;
     if (wasIntentional) {
       setMount({ status: 'idle', mountPoint: null, message: '' });
     } else {
@@ -340,7 +563,12 @@ async function driveConnect() {
   // O mount não "termina" — fica rodando. Depois de alguns segundos sem crash,
   // consideramos montado.
   setTimeout(() => {
-    if (rcloneProc) setMount({ status: 'mounted', mountPoint, message: 'Conectado' });
+    if (rcloneProc) {
+      setMount({ status: 'mounted', mountPoint, message: 'Conectado' });
+      startSyncPoll();
+      warmPins();       // pré-aquece as pastas fixas
+      startPinLoop();   // e re-aquece periodicamente
+    }
   }, 3500);
 
   return mountState;
@@ -356,6 +584,7 @@ function driveDisconnect() {
 ipcMain.handle('drive:connect', () => driveConnect());
 ipcMain.handle('drive:disconnect', () => driveDisconnect());
 ipcMain.handle('drive:status', () => mountState);
+ipcMain.handle('drive:syncState', () => syncState);
 ipcMain.handle('drive:open', () => { openMount(); return { ok: true }; });
 
 // ══════════════════════════════════════════════════════════════════════

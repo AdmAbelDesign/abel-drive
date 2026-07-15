@@ -128,8 +128,11 @@ async function doLogout() {
 }
 
 // ── Drive: conectar / desconectar / status / avisos ────────────────────
+let lastDriveStatus = 'idle';
 function renderDrive(s) {
   const st = (s && s.status) || 'idle';
+  lastDriveStatus = st;
+  if (st !== 'mounted') { $('drive-sync').classList.add('hidden'); $('pins').classList.add('hidden'); }
   const dot = $('drive-dot');
   dot.className = 'drive-dot' + (
     st === 'mounted' ? ' on' :
@@ -161,7 +164,102 @@ function renderDrive(s) {
   }
 }
 
-function refreshDrive() { window.abel.driveStatus().then(renderDrive); }
+function refreshDrive() {
+  window.abel.driveStatus().then(renderDrive);
+  window.abel.driveSyncState().then(renderSync);
+  window.abel.pinsList().then(renderPins);
+}
+
+// ── pastas fixas (pin) ─────────────────────────────────────────────────
+function refreshPins() { window.abel.pinsList().then(renderPins); }
+
+function renderPins(s) {
+  const box = $('pins');
+  if (lastDriveStatus !== 'mounted') { box.classList.add('hidden'); return; }
+  box.classList.remove('hidden');
+
+  const pins = (s && s.pins) || [];
+  const warm = (s && s.warm) || {};
+  const list = $('pins-list');
+  list.innerHTML = '';
+
+  if (pins.length === 0) {
+    const e = document.createElement('div');
+    e.className = 'pins-empty';
+    e.textContent = 'Nenhuma pasta fixa ainda. Fixe o INDD e as imagens para abrir instantâneo.';
+    list.appendChild(e);
+  } else {
+    pins.forEach((rel) => {
+      const name = String(rel).split(/[\\/]/).pop();
+      const row = document.createElement('div');
+      row.className = 'pin-row';
+      row.innerHTML =
+        '<span class="pin-dot"></span>' +
+        '<span class="pin-name" title="' + escapeHtml(rel) + '">' + escapeHtml(name) + '</span>';
+      const x = document.createElement('button');
+      x.className = 'pin-x';
+      x.textContent = '✕';
+      x.title = 'Desafixar';
+      x.onclick = async () => { await window.abel.pinRemove(rel); refreshPins(); };
+      row.appendChild(x);
+      list.appendChild(row);
+    });
+  }
+
+  const prog = $('pins-progress');
+  if (warm && warm.warming) {
+    prog.classList.remove('hidden');
+    prog.textContent = 'Baixando para uso local… ' + (warm.done || 0) + '/' + (warm.total || 0);
+  } else {
+    prog.classList.add('hidden');
+  }
+}
+
+async function addPin() {
+  const r = await window.abel.pinAdd();
+  if (r && !r.ok && r.error) msg(r.error, 'info');
+  refreshPins();
+}
+
+// ── progresso de sync (enviando… / tudo sincronizado) ──────────────────
+function fmtSpeed(bps) {
+  if (!bps || bps < 1) return '';
+  const u = ['B', 'KB', 'MB', 'GB'];
+  let v = bps, i = 0;
+  while (v >= 1024 && i < u.length - 1) { v /= 1024; i++; }
+  return (v < 10 ? v.toFixed(1) : Math.round(v)) + ' ' + u[i] + '/s';
+}
+
+function renderSync(s) {
+  const box = $('drive-sync');
+  const st = (s && s.state) || 'idle';
+  // Só mostra quando o drive está montado e há algo a dizer.
+  if (lastDriveStatus !== 'mounted' || st === 'idle') { box.classList.add('hidden'); return; }
+  box.classList.remove('hidden');
+
+  const dot = $('sync-dot');
+  const bar = $('sync-bar');
+  const fill = $('sync-fill');
+
+  if (st === 'uploading') {
+    dot.className = 'sync-dot up';
+    const n = s.pending || s.transfers || 0;
+    let t = n > 0 ? ('Enviando ' + n + (n === 1 ? ' arquivo' : ' arquivos') + '…') : 'Enviando…';
+    if (s.percent != null) t += '  ' + s.percent + '%';
+    const spd = fmtSpeed(s.speed);
+    if (spd) t += ' · ' + spd;
+    $('sync-text').textContent = t;
+    if (s.percent != null) { bar.classList.remove('hidden'); fill.style.width = s.percent + '%'; }
+    else { bar.classList.add('hidden'); }
+  } else {
+    // sincronizado (ou com erro de upload sendo retentado)
+    dot.className = 'sync-dot ok';
+    $('sync-text').textContent = (s.errored > 0)
+      ? (s.errored + (s.errored === 1 ? ' arquivo com erro — tentando de novo' : ' arquivos com erro — tentando de novo'))
+      : 'Tudo sincronizado';
+    bar.classList.add('hidden');
+  }
+}
 
 async function toggleDrive() {
   const s = await window.abel.driveStatus();
@@ -218,6 +316,9 @@ window.addEventListener('DOMContentLoaded', async () => {
   $('btn-drive-open').onclick = () => window.abel.driveOpen();
   window.abel.onDriveState(renderDrive);
   window.abel.onDriveToast(showToast);
+  window.abel.onDriveSync(renderSync);
+  window.abel.onPins(renderPins);
+  $('btn-pin-add').onclick = addPin;
 
   window.abel.version().then((v) => {
     const el = $('app-version');

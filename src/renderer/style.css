@@ -224,6 +224,116 @@ input.pin {
   min-height: 16px;
 }
 
+/* ── progresso de sync (enviando… / tudo sincronizado) ─────────────── */
+.drive-sync {
+  background: #fff;
+  border: 1px solid var(--border);
+  border-radius: 9px;
+  padding: 9px 11px;
+  margin-bottom: 14px;
+}
+.sync-head {
+  display: flex;
+  align-items: center;
+  gap: 7px;
+  font-size: 12px;
+  font-weight: 600;
+  color: var(--text-secondary);
+}
+.sync-dot {
+  width: 8px; height: 8px; border-radius: 50%;
+  background: var(--text-placeholder);
+  flex: 0 0 auto;
+}
+.sync-dot.ok { background: #6c9c14; }
+.sync-dot.up { background: var(--abel-blue); animation: sync-pulse 1.1s ease-in-out infinite; }
+@keyframes sync-pulse { 0%, 100% { opacity: 1; } 50% { opacity: 0.35; } }
+.sync-text { flex: 1 1 auto; }
+.sync-bar {
+  height: 5px;
+  background: var(--bg-app);
+  border-radius: 3px;
+  overflow: hidden;
+  margin-top: 8px;
+}
+.sync-fill {
+  height: 100%;
+  width: 0%;
+  background: var(--abel-blue);
+  border-radius: 3px;
+  transition: width 0.4s ease;
+}
+
+/* ── pastas fixas (pin) ────────────────────────────────────────────── */
+.pins {
+  margin-top: 14px;
+  padding-top: 14px;
+  border-top: 1px solid var(--border);
+}
+.pins-title {
+  font-size: 12px;
+  font-weight: 700;
+  color: var(--text-primary);
+  margin-bottom: 8px;
+}
+.pins-title .pins-hint {
+  font-weight: 500;
+  color: var(--text-muted);
+  font-size: 11px;
+}
+.pins-list { margin-bottom: 8px; }
+.pins-empty {
+  font-size: 11.5px;
+  color: var(--text-muted);
+  line-height: 1.4;
+  padding: 2px 0 4px;
+}
+.pin-row {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  background: #fff;
+  border: 1px solid var(--border);
+  border-radius: 8px;
+  padding: 8px 10px;
+  margin-bottom: 6px;
+}
+.pin-dot {
+  width: 8px; height: 8px; border-radius: 50%;
+  background: var(--abel-green);
+  flex: 0 0 auto;
+}
+.pin-name {
+  flex: 1 1 auto;
+  font-size: 12.5px;
+  font-weight: 600;
+  color: var(--text-primary);
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+.pin-x {
+  flex: 0 0 auto;
+  background: transparent;
+  border: none;
+  color: var(--text-placeholder);
+  font-size: 12px;
+  cursor: pointer;
+  padding: 2px 4px;
+  border-radius: 4px;
+}
+.pin-x:hover { color: var(--abel-red); }
+.pins-progress {
+  font-size: 11.5px;
+  color: var(--abel-blue);
+  margin-bottom: 8px;
+}
+.btn.pin-add {
+  margin-top: 2px;
+  font-size: 12.5px;
+  padding: 8px;
+}
+
 /* ── toast (aviso do drive, ex.: arquivo travado) ──────────────────── */
 .toast {
   position: fixed;

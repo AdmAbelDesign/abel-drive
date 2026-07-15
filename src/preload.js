@@ -18,7 +18,13 @@ contextBridge.exposeInMainWorld('abel', {
   driveConnect:    () => ipcRenderer.invoke('drive:connect'),
   driveDisconnect: () => ipcRenderer.invoke('drive:disconnect'),
   driveStatus:     () => ipcRenderer.invoke('drive:status'),
+  driveSyncState:  () => ipcRenderer.invoke('drive:syncState'),
   driveOpen:       () => ipcRenderer.invoke('drive:open'),
+
+  // Pastas fixas (pin)
+  pinsList:  () => ipcRenderer.invoke('pins:list'),
+  pinAdd:    () => ipcRenderer.invoke('pins:add'),
+  pinRemove: (rel) => ipcRenderer.invoke('pins:remove', rel),
 
   // Atualização
   updateStatus:  () => ipcRenderer.invoke('update:status'),
@@ -27,4 +33,6 @@ contextBridge.exposeInMainWorld('abel', {
   onUpdateState: (cb) => ipcRenderer.on('update:state', (_e, s) => cb(s)),
   onDriveState: (cb) => ipcRenderer.on('drive:state', (_e, s) => cb(s)),
   onDriveToast: (cb) => ipcRenderer.on('drive:toast', (_e, t) => cb(t)),
+  onDriveSync: (cb) => ipcRenderer.on('drive:sync', (_e, s) => cb(s)),
+  onPins: (cb) => ipcRenderer.on('drive:pins', (_e, s) => cb(s)),
 });
