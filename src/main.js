@@ -275,7 +275,7 @@ async function walkFiles(absDir, onFile) {
   // devolver o tipo como DESCONHECIDO → isDirectory()/isFile() ambos falsos e a
   // pasta inteira é pulada. Por isso lemos só os NOMES e damos stat em cada um.
   try { names = await fs.promises.readdir(absDir); }
-  catch (_) { return; }
+  catch (e) { pinLog('readdir FALHOU ' + absDir + ': ' + (e && (e.message || e))); return; }
   for (const name of names) {
     if (!rcloneProc) return; // desmontou no meio
     const p = path.join(absDir, name);
@@ -309,7 +309,7 @@ async function warmFile(abs, mp) {
 }
 
 // Pré-aquece todas as pastas fixas (uma passada). Idempotente e best-effort.
-async function warmPins() {
+async function warmPins(attempt = 0) {
   if (!rcloneProc || pinWarm.warming) return;
   const mp = mountState.mountPoint;
   if (!mp) return;
@@ -318,18 +318,35 @@ async function warmPins() {
 
   pinWarm = { warming: true, done: 0, total: 0 };
   emitPins();
+  pinLog('warm início — ' + pins.length + ' fixa(s): ' + JSON.stringify(pins) + (attempt ? ' (tentativa ' + (attempt + 1) + ')' : ''));
 
   const files = [];
-  for (const rel of pins) await walkFiles(mountJoin(mp, rel), async (f) => { files.push(f); });
+  for (const rel of pins) {
+    const abs = mountJoin(mp, rel);
+    pinLog('percorrendo ' + abs);
+    await walkFiles(abs, async (f) => { files.push(f); });
+  }
+  pinLog('encontrados ' + files.length + ' arquivo(s)');
+
+  // O mount pode não estar pronto na 1ª passada (readdir vem vazio). Tenta de
+  // novo algumas vezes antes de desistir.
+  if (files.length === 0 && attempt < 3) {
+    pinWarm = { warming: false, done: 0, total: 0 };
+    emitPins();
+    pinLog('0 arquivos — nova tentativa em 4s');
+    setTimeout(() => warmPins(attempt + 1), 4000);
+    return;
+  }
+
   pinWarm.total = files.length;
   emitPins();
-
   for (const f of files) {
     if (!rcloneProc) break;
     await warmFile(f, mp);
     pinWarm.done++;
     emitPins();
   }
+  pinLog('warm concluído — ' + files.length + ' arquivo(s)');
   pinWarm = { warming: false, done: 0, total: 0 };
   emitPins();
 }
@@ -444,6 +461,9 @@ async function ensureWinFsp() {
 
 function confPath() { return path.join(app.getPath('userData'), 'rclone.conf'); }
 function logFilePath() { return path.join(app.getPath('userData'), 'rclone.log'); }
+function pinLog(msg) {
+  try { fs.appendFileSync(logFilePath(), '[pin] ' + new Date().toISOString() + ' ' + msg + '\n'); } catch (_) {}
+}
 
 // O rclone guarda a senha OBSCURECIDA (não em texto puro). Rodamos
 // `rclone obscure <segredo>` para obter o valor e gravar no .conf.
