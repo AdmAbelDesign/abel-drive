@@ -195,7 +195,7 @@ function setSync(patch) {
 
 // Chama um comando do RC do rclone (POST em loopback, Basic auth). Devolve o
 // JSON ou null (quando o RC ainda não subiu ou o mount caiu).
-async function rcCall(command) {
+async function rcCall(command, params) {
   if (!rcAddr || !rcAuth) return null;
   try {
     const res = await fetch('http://' + rcAddr + '/' + command, {
@@ -204,7 +204,7 @@ async function rcCall(command) {
         'Content-Type': 'application/json',
         'Authorization': 'Basic ' + Buffer.from(rcAuth.user + ':' + rcAuth.pass).toString('base64'),
       },
-      body: '{}',
+      body: JSON.stringify(params || {}),
     });
     return await res.json();
   } catch (_) { return null; }
@@ -309,6 +309,17 @@ async function warmFile(abs, mp) {
 }
 
 // Pré-aquece todas as pastas fixas (uma passada). Idempotente e best-effort.
+// Lista os arquivos de uma pasta fixa RÁPIDO, via o RC do rclone (uma chamada
+// recursiva, resolvida no servidor) — evita o stat-por-item lento do fs sobre a
+// rede. Devolve array de caminhos no mount, ou null se o RC falhar (fallback fs).
+async function rcListMountPaths(mp, rel) {
+  const r = await rcCall('operations/list', {
+    fs: 'abel:', remote: rel.replace(/\\/g, '/'), opt: { recurse: true, filesOnly: true },
+  });
+  if (!r || !Array.isArray(r.list)) return null;
+  return r.list.filter((it) => it && !it.IsDir).map((it) => mountJoin(mp, rel + '/' + it.Path));
+}
+
 async function warmPins(attempt = 0) {
   if (!rcloneProc || pinWarm.warming) return;
   const mp = mountState.mountPoint;
@@ -320,16 +331,22 @@ async function warmPins(attempt = 0) {
   emitPins();
   pinLog('warm início — ' + pins.length + ' fixa(s): ' + JSON.stringify(pins) + (attempt ? ' (tentativa ' + (attempt + 1) + ')' : ''));
 
-  const files = [];
+  let files = [];
   for (const rel of pins) {
-    const abs = mountJoin(mp, rel);
-    pinLog('percorrendo ' + abs);
-    await walkFiles(abs, async (f) => { files.push(f); });
+    let listed = await rcListMountPaths(mp, rel);
+    if (listed === null) {
+      pinLog('operations/list falhou em "' + rel + '" — caindo pro fs-walk');
+      const acc = [];
+      await walkFiles(mountJoin(mp, rel), async (f) => { acc.push(f); });
+      listed = acc;
+    } else {
+      pinLog('list "' + rel + '": ' + listed.length + ' arquivo(s)');
+    }
+    files = files.concat(listed);
   }
-  pinLog('encontrados ' + files.length + ' arquivo(s)');
+  pinLog('total: ' + files.length + ' arquivo(s)');
 
-  // O mount pode não estar pronto na 1ª passada (readdir vem vazio). Tenta de
-  // novo algumas vezes antes de desistir.
+  // O mount/gateway pode não estar pronto na 1ª passada. Tenta de novo.
   if (files.length === 0 && attempt < 3) {
     pinWarm = { warming: false, done: 0, total: 0 };
     emitPins();
@@ -340,13 +357,22 @@ async function warmPins(attempt = 0) {
 
   pinWarm.total = files.length;
   emitPins();
-  for (const f of files) {
-    if (!rcloneProc) break;
-    await warmFile(f, mp);
-    pinWarm.done++;
-    emitPins();
+
+  // Baixa com concorrência limitada (4 por vez) — o download é o custo real do
+  // "deixar local"; o progresso reflete isso.
+  const CONC = 4;
+  let idx = 0;
+  async function worker() {
+    while (idx < files.length && rcloneProc) {
+      const f = files[idx++];
+      await warmFile(f, mp);
+      pinWarm.done++;
+      if (pinWarm.done % 5 === 0 || pinWarm.done === files.length) emitPins();
+    }
   }
-  pinLog('warm concluído — ' + files.length + ' arquivo(s)');
+  await Promise.all(Array.from({ length: CONC }, () => worker()));
+
+  pinLog('warm concluído — ' + pinWarm.done + '/' + files.length);
   pinWarm = { warming: false, done: 0, total: 0 };
   emitPins();
 }
