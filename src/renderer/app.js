@@ -213,9 +213,13 @@ function renderPins(s) {
     prog.classList.remove('hidden');
     const done = warm.done || 0, total = warm.total || 0;
     if (total === 0) {
-      // ainda listando (a coleção pode ser grande) — não é 0/0 travado.
+      // ainda descobrindo os primeiros arquivos — não é 0/0 travado.
       $('pins-progress-text').textContent = 'Preparando… (listando arquivos)';
       $('pins-fill').style.width = '0%';
+    } else if (warm.listing) {
+      // já baixando, mas ainda descobrindo mais arquivos (árvore grande).
+      $('pins-progress-text').textContent = 'Baixando… ' + done + '/' + total + ' (ainda listando)';
+      $('pins-fill').style.width = Math.round((done / total) * 100) + '%';
     } else {
       $('pins-progress-text').textContent = 'Baixando para uso local… ' + done + '/' + total;
       $('pins-fill').style.width = Math.round((done / total) * 100) + '%';
