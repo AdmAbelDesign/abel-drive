@@ -333,14 +333,15 @@ async function warmPins(attempt = 0) {
 
   let files = [];
   for (const rel of pins) {
+    const t0 = Date.now();
     let listed = await rcListMountPaths(mp, rel);
     if (listed === null) {
-      pinLog('operations/list falhou em "' + rel + '" — caindo pro fs-walk');
+      pinLog('operations/list falhou em "' + rel + '" (' + (Date.now() - t0) + 'ms) — caindo pro fs-walk');
       const acc = [];
       await walkFiles(mountJoin(mp, rel), async (f) => { acc.push(f); });
       listed = acc;
     } else {
-      pinLog('list "' + rel + '": ' + listed.length + ' arquivo(s)');
+      pinLog('list "' + rel + '": ' + listed.length + ' arquivo(s) em ' + (Date.now() - t0) + 'ms');
     }
     files = files.concat(listed);
   }

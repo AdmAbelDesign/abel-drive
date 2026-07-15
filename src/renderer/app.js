@@ -212,9 +212,14 @@ function renderPins(s) {
   if (warm && warm.warming) {
     prog.classList.remove('hidden');
     const done = warm.done || 0, total = warm.total || 0;
-    $('pins-progress-text').textContent = 'Baixando para uso local… ' + done + '/' + total;
-    const pct = total > 0 ? Math.round((done / total) * 100) : 0;
-    $('pins-fill').style.width = pct + '%';
+    if (total === 0) {
+      // ainda listando (a coleção pode ser grande) — não é 0/0 travado.
+      $('pins-progress-text').textContent = 'Preparando… (listando arquivos)';
+      $('pins-fill').style.width = '0%';
+    } else {
+      $('pins-progress-text').textContent = 'Baixando para uso local… ' + done + '/' + total;
+      $('pins-fill').style.width = Math.round((done / total) * 100) + '%';
+    }
   } else {
     prog.classList.add('hidden');
   }
