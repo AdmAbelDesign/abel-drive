@@ -431,6 +431,7 @@ async function ensureWinFsp() {
 }
 
 function confPath() { return path.join(app.getPath('userData'), 'rclone.conf'); }
+function logFilePath() { return path.join(app.getPath('userData'), 'rclone.log'); }
 
 // O rclone guarda a senha OBSCURECIDA (não em texto puro). Rodamos
 // `rclone obscure <segredo>` para obter o valor e gravar no .conf.
@@ -456,6 +457,8 @@ function writeRcloneConf(obscured) {
 
 // Interpreta o log do rclone e vira aviso na tela (o valor sobre o mount cru).
 function handleRcloneLog(text) {
+  // Persiste o log da sessão em arquivo (o balão some rápido; o log fica).
+  try { fs.appendFileSync(logFilePath(), String(text)); } catch (_) {}
   for (const line of String(text).split(/\r?\n/)) {
     if (!line.trim()) continue;
     if (/\b423\b|Locked/i.test(line)) {
@@ -490,6 +493,8 @@ async function getCredentialSecret() {
 async function driveConnect() {
   if (rcloneProc) return mountState;
   setMount({ status: 'connecting', message: 'Pegando sua credencial…' });
+  // Começa um log limpo por sessão (pra capturar erros do mount).
+  try { fs.writeFileSync(logFilePath(), '=== Abel Drive — sessão ' + new Date().toISOString() + ' ===\n'); } catch (_) {}
 
   const c = await getCredentialSecret();
   if (!c.ok) {
@@ -536,6 +541,7 @@ async function driveConnect() {
     '--buffer-size', '32M',            // buffer em memória por arquivo
     '--vfs-read-chunk-size', '32M',    // baixa o arquivo em pedaços maiores (menos idas)
     '--transfers', '8',                // mais uploads/downloads em paralelo (sync + pin)
+    '--log-level', 'INFO',             // detalhe pro log (capturamos em arquivo)
     '--volname', 'Abel Drive',
     '--rc',                            // liga o remote control (só leitura de stats)
     '--rc-addr', rcAddr,
@@ -622,6 +628,8 @@ function buildTrayMenu() {
     { type: 'separator' },
     { label: 'Iniciar com o Windows', type: 'checkbox', checked: openAtLogin,
       click: (item) => app.setLoginItemSettings({ openAtLogin: item.checked }) },
+    { type: 'separator' },
+    { label: 'Abrir log do drive', click: () => shell.openPath(logFilePath()) },
     { label: 'Sair', click: () => { isQuitting = true; app.quit(); } },
   ]);
 }
