@@ -328,6 +328,23 @@ input.pin {
   color: var(--abel-blue);
   margin-bottom: 8px;
 }
+.pins-progress-text { margin-bottom: 5px; }
+
+/* ── erro do drive (persistente, embaixo do status) ────────────────── */
+.drive-error {
+  display: none;
+  font-size: 12px;
+  line-height: 1.45;
+  color: #b3243c;
+  background: #fff0f2;
+  border-left: 3px solid var(--abel-red);
+  border-radius: 8px;
+  padding: 8px 10px;
+  margin-bottom: 12px;
+  word-break: break-word;
+}
+.drive-error.show { display: block; }
+.drive-error.warn { color: #a24a1c; background: #fff5ee; border-left-color: var(--abel-orange); }
 .btn.pin-add {
   margin-top: 2px;
   font-size: 12.5px;

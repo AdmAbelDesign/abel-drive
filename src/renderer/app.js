@@ -133,6 +133,8 @@ function renderDrive(s) {
   const st = (s && s.status) || 'idle';
   lastDriveStatus = st;
   if (st !== 'mounted') { $('drive-sync').classList.add('hidden'); $('pins').classList.add('hidden'); }
+  // Nova tentativa de conexão limpa o último erro mostrado.
+  if (st === 'connecting') $('drive-error').className = 'drive-error hidden';
   const dot = $('drive-dot');
   dot.className = 'drive-dot' + (
     st === 'mounted' ? ' on' :
@@ -209,7 +211,10 @@ function renderPins(s) {
   const prog = $('pins-progress');
   if (warm && warm.warming) {
     prog.classList.remove('hidden');
-    prog.textContent = 'Baixando para uso local… ' + (warm.done || 0) + '/' + (warm.total || 0);
+    const done = warm.done || 0, total = warm.total || 0;
+    $('pins-progress-text').textContent = 'Baixando para uso local… ' + done + '/' + total;
+    const pct = total > 0 ? Math.round((done / total) * 100) : 0;
+    $('pins-fill').style.width = pct + '%';
   } else {
     prog.classList.add('hidden');
   }
@@ -274,6 +279,13 @@ function showToast(t) {
   el.className = 'toast ' + (t.kind || 'info');
   clearTimeout(toastTimer);
   toastTimer = setTimeout(() => { el.className = 'toast hidden'; }, 6000);
+  // Persiste erros/avisos numa linha fixa embaixo do status (o balão some rápido,
+  // isso fica até reconectar).
+  if (t.kind === 'error' || t.kind === 'warn') {
+    const err = $('drive-error');
+    err.textContent = t.text;
+    err.className = 'drive-error show' + (t.kind === 'warn' ? ' warn' : '');
+  }
 }
 
 // ── Atualização ────────────────────────────────────────────────────────

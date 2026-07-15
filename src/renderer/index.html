@@ -62,6 +62,7 @@
           <span id="drive-label">Drive desconectado</span>
         </div>
         <div id="drive-msg" class="drive-msg"></div>
+        <div id="drive-error" class="drive-error hidden"></div>
 
         <div id="drive-sync" class="drive-sync hidden">
           <div class="sync-head">
@@ -77,7 +78,10 @@
         <div id="pins" class="pins hidden">
           <div class="pins-title">Pastas fixas <span class="pins-hint">sempre no seu computador</span></div>
           <div id="pins-list" class="pins-list"></div>
-          <div id="pins-progress" class="pins-progress hidden"></div>
+          <div id="pins-progress" class="pins-progress hidden">
+            <div id="pins-progress-text" class="pins-progress-text"></div>
+            <div class="sync-bar"><div id="pins-fill" class="sync-fill"></div></div>
+          </div>
           <button id="btn-pin-add" class="btn btn-ghost pin-add">+ Fixar pasta, obra ou coleção</button>
         </div>
       </div>

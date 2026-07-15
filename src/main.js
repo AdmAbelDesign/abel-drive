@@ -42,6 +42,13 @@ function resolveMountPoint() {
   return IS_MAC ? path.join(os.homedir(), 'Abel Drive') : pickWindowsDriveLetter();
 }
 
+// Junta o ponto de montagem com um caminho relativo. GOTCHA Windows: `path.join
+// ("Z:", "x")` vira "Z:x" (relativo ao drive), não "Z:\x". Força a raiz.
+function mountJoin(mp, rel) {
+  if (IS_MAC) return path.join(mp, rel);
+  return path.win32.join(mp.endsWith('\\') ? mp : mp + '\\', rel);
+}
+
 let mainWindow = null;
 let tray = null;
 let isQuitting = false;
@@ -263,14 +270,19 @@ function relToMount(abs, mp) {
 
 // Percorre a pasta (recursivo) e entrega cada arquivo.
 async function walkFiles(absDir, onFile) {
-  let entries;
-  try { entries = await fs.promises.readdir(absDir, { withFileTypes: true }); }
+  let names;
+  // GOTCHA: no mount FUSE (rclone) o readdir com { withFileTypes:true } pode
+  // devolver o tipo como DESCONHECIDO → isDirectory()/isFile() ambos falsos e a
+  // pasta inteira é pulada. Por isso lemos só os NOMES e damos stat em cada um.
+  try { names = await fs.promises.readdir(absDir); }
   catch (_) { return; }
-  for (const ent of entries) {
+  for (const name of names) {
     if (!rcloneProc) return; // desmontou no meio
-    const p = path.join(absDir, ent.name);
-    if (ent.isDirectory()) await walkFiles(p, onFile);
-    else if (ent.isFile()) await onFile(p);
+    const p = path.join(absDir, name);
+    let st;
+    try { st = await fs.promises.stat(p); } catch (_) { continue; }
+    if (st.isDirectory()) await walkFiles(p, onFile);
+    else if (st.isFile()) await onFile(p);
   }
 }
 
@@ -308,7 +320,7 @@ async function warmPins() {
   emitPins();
 
   const files = [];
-  for (const rel of pins) await walkFiles(path.join(mp, rel), async (f) => { files.push(f); });
+  for (const rel of pins) await walkFiles(mountJoin(mp, rel), async (f) => { files.push(f); });
   pinWarm.total = files.length;
   emitPins();
 
