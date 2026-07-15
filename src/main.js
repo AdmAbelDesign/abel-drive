@@ -529,8 +529,13 @@ async function driveConnect() {
     '--vfs-cache-mode', 'full',
     '--vfs-cache-max-age', '24h',      // mantém o baixado por 24h (reabrir rápido)
     '--vfs-fast-fingerprint',          // fingerprint por mtime+tamanho (INDD grande)
-    '--dir-cache-time', '1m',          // navegação mais leve
-    '--attr-timeout', '3s',
+    // ── afinação de performance (15/jul) ──────────────────────────────
+    '--dir-cache-time', '5m',          // revisitar pasta já vista = instantâneo por 5min
+    '--attr-timeout', '5s',            // cache de atributos do kernel
+    '--vfs-read-ahead', '128M',        // lê adiante em leitura sequencial (abrir INDD)
+    '--buffer-size', '32M',            // buffer em memória por arquivo
+    '--vfs-read-chunk-size', '32M',    // baixa o arquivo em pedaços maiores (menos idas)
+    '--transfers', '8',                // mais uploads/downloads em paralelo (sync + pin)
     '--volname', 'Abel Drive',
     '--rc',                            // liga o remote control (só leitura de stats)
     '--rc-addr', rcAddr,

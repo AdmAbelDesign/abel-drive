@@ -186,7 +186,7 @@ function renderPins(s) {
   if (pins.length === 0) {
     const e = document.createElement('div');
     e.className = 'pins-empty';
-    e.textContent = 'Nenhuma pasta fixa ainda. Fixe o INDD e as imagens para abrir instantâneo.';
+    e.textContent = 'Nenhuma pasta fixa ainda. Fixe uma obra ou coleção inteira para abrir tudo instantâneo (baixa e mantém local).';
     list.appendChild(e);
   } else {
     pins.forEach((rel) => {
