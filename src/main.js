@@ -347,7 +347,11 @@ async function warmPins(attempt = 0) {
       if (!items) { pinLog('list falhou/vazio: ' + rel); continue; }
       listedDirs++;
       for (const it of items) {
-        const childRel = rel + '/' + it.Path;
+        // GOTCHA: operations/list devolve Path COMPLETO (relativo à raiz do
+        // drive), não relativo ao pai. Se já vier com o prefixo do pai, usa como
+        // está; senão completa. (Sem isso o caminho dobrava → 404 em tudo.)
+        const p = String(it.Path).replace(/\\/g, '/');
+        const childRel = p.startsWith(rel + '/') ? p : rel + '/' + p;
         if (it.IsDir) dirQueue.push(childRel);
         else { fileQueue.push(mountJoin(mp, childRel)); pinWarm.total++; }
       }
@@ -532,7 +536,9 @@ function handleRcloneLog(text) {
     if (!line.trim()) continue;
     if (/\b423\b|Locked/i.test(line)) {
       toast('warn', 'Um arquivo está em uso por outra pessoa — sua alteração não foi salva no servidor. Feche sem salvar.');
-    } else if (/ERROR/i.test(line) && !/symlinks not supported/i.test(line)) {
+    } else if (/ERROR/i.test(line) &&
+               !/symlinks not supported|ListJSON|directory not found|context canceled|operations\/list/i.test(line)) {
+      // Erros de listagem/timeout são ruído da sondagem do pin — não alarmam.
       toast('error', 'Problema no drive: ' + line.replace(/^.*ERROR\s*:?\s*/i, '').slice(0, 140));
     }
   }
