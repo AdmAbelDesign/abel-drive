@@ -620,7 +620,14 @@ async function driveConnect() {
     '--config', confPath(),
     '--cache-dir', cacheDir,
     '--vfs-cache-mode', 'full',
-    '--vfs-cache-max-age', '24h',      // mantém o baixado por 24h (reabrir rápido)
+    '--vfs-cache-max-age', '9999h',    // pin = "sempre no PC": NÃO expira por idade.
+                                       // (era 24h — o rclone descartava as fixas no
+                                       // remount após reboot/máquina desligada a noite,
+                                       // e o warmPins rebaixava a coleção inteira do zero.)
+    '--vfs-cache-max-size', '100G',    // teto do cache: quando encher, o rclone descarta
+                                       // o MENOS usado 1º; as fixas, re-aquecidas a cada
+                                       // 3h (startPinLoop), ficam "quentes" e sobrevivem
+                                       // à limpeza por tamanho. Ajustável conforme o disco.
     '--vfs-fast-fingerprint',          // fingerprint por mtime+tamanho (INDD grande)
     // ── afinação de performance (15/jul) ──────────────────────────────
     '--dir-cache-time', '1000h',       // cache agressivo: pasta já vista = instantâneo
