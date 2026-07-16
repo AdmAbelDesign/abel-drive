@@ -313,6 +313,19 @@ async function warmFile(abs, mp) {
 // uma chamada por pasta, rápida e sem risco de timeout (o recursivo na coleção
 // inteira estourava em ~5min = "context canceled"). Devolve {Path,IsDir,Size}[]
 // ou null se falhar.
+// Pré-aquece a LISTAGEM (dir cache do rclone) das pastas fixas, em background.
+// Com --dir-cache-time alto, uma vez listada a pasta fica instantânea pra navegar
+// no Explorer. Só as fixas (não a empresa toda). Fire-and-forget.
+function refreshPinnedDirs() {
+  const pins = readStore().pins || [];
+  for (const rel of pins) {
+    if (!rcloneProc) break;
+    rcCall('vfs/refresh', { recursive: 'true', dir: String(rel).replace(/\\/g, '/') })
+      .then((r) => pinLog('vfs/refresh ' + rel + ': ' + (r ? 'ok' : 'sem resposta')))
+      .catch(() => {});
+  }
+}
+
 async function rcListDir(rel) {
   const r = await rcCall('operations/list', {
     fs: 'abel:', remote: String(rel).replace(/\\/g, '/'), opt: { recurse: false },
@@ -655,8 +668,9 @@ async function driveConnect() {
     if (rcloneProc) {
       setMount({ status: 'mounted', mountPoint, message: 'Conectado' });
       startSyncPoll();
-      warmPins();       // pré-aquece as pastas fixas
-      startPinLoop();   // e re-aquece periodicamente
+      warmPins();          // baixa o conteúdo das pastas fixas
+      refreshPinnedDirs(); // e pré-aquece a listagem delas (navegar = instantâneo)
+      startPinLoop();      // re-aquece periodicamente
     }
   }, 3500);
 
