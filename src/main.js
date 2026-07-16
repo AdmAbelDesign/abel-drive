@@ -369,7 +369,7 @@ async function warmPins(attempt = 0) {
       const f = fileQueue.shift();
       await warmFile(f, mp);
       pinWarm.done++;
-      if (pinWarm.done % 3 === 0) emitPins();
+      emitPins();   // a cada arquivo → barra anda suave
     }
   };
   await Promise.all([lister, ...Array.from({ length: CONC }, () => worker())]);
