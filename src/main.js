@@ -610,7 +610,10 @@ async function driveConnect() {
     '--vfs-cache-max-age', '24h',      // mantém o baixado por 24h (reabrir rápido)
     '--vfs-fast-fingerprint',          // fingerprint por mtime+tamanho (INDD grande)
     // ── afinação de performance (15/jul) ──────────────────────────────
-    '--dir-cache-time', '5m',          // revisitar pasta já vista = instantâneo por 5min
+    '--dir-cache-time', '1000h',       // cache agressivo: pasta já vista = instantâneo
+                                       // (sem polling no WebDAV → mudança de OUTRO
+                                       // usuário só aparece no remount/refresh; ok no
+                                       // piloto, reavaliar p/ equipe com vfs/refresh)
     '--attr-timeout', '5s',            // cache de atributos do kernel
     '--vfs-read-ahead', '128M',        // lê adiante em leitura sequencial (abrir INDD)
     '--buffer-size', '32M',            // buffer em memória por arquivo
