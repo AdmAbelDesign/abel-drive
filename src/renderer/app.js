@@ -144,6 +144,7 @@ function renderDrive(s) {
   const labels = {
     idle: 'Drive desconectado',
     connecting: 'Conectando…',
+    reconnecting: 'Reconectando…',
     mounted: 'Conectado em ' + ((s && s.mountPoint) || 'Z:'),
     disconnecting: 'Desconectando…',
     error: 'Desconectado',
@@ -152,7 +153,7 @@ function renderDrive(s) {
   $('drive-msg').textContent = (s && s.message) || '';
 
   const btn = $('btn-drive');
-  const busy = (st === 'connecting' || st === 'disconnecting');
+  const busy = (st === 'connecting' || st === 'disconnecting' || st === 'reconnecting');
   btn.disabled = busy;
   btn.classList.toggle('spin', busy);
   if (st === 'mounted') {
@@ -258,19 +259,32 @@ function renderSync(s) {
   if (st === 'uploading') {
     dot.className = 'sync-dot up';
     const n = s.pending || s.transfers || 0;
-    let t = n > 0 ? ('Enviando ' + n + (n === 1 ? ' arquivo' : ' arquivos') + '…') : 'Enviando…';
-    if (s.percent != null) t += '  ' + s.percent + '%';
-    const spd = fmtSpeed(s.speed);
-    if (spd) t += ' · ' + spd;
-    $('sync-text').textContent = t;
-    if (s.percent != null) { bar.classList.remove('hidden'); fill.style.width = s.percent + '%'; }
-    else { bar.classList.add('hidden'); }
+    if (s.percent != null) {
+      // Bytes já subindo → barra real com %.
+      let t = n > 0 ? ('Enviando ' + n + (n === 1 ? ' arquivo' : ' arquivos') + '…') : 'Enviando…';
+      t += '  ' + s.percent + '%';
+      const spd = fmtSpeed(s.speed);
+      if (spd) t += ' · ' + spd;
+      $('sync-text').textContent = t;
+      bar.classList.remove('hidden', 'indeterminate');
+      fill.style.width = s.percent + '%';
+    } else {
+      // Enfileirado, bytes ainda não começaram (percent null) → barra
+      // INDETERMINADA em vez de "Enviando…" pelado (o "minuto sem barra").
+      $('sync-text').textContent = n > 0
+        ? ('Preparando envio de ' + n + (n === 1 ? ' arquivo' : ' arquivos') + '…')
+        : 'Preparando envio…';
+      fill.style.width = '';           // a animação CSS controla o bloco
+      bar.classList.remove('hidden');
+      bar.classList.add('indeterminate');
+    }
   } else {
     // sincronizado (ou com erro de upload sendo retentado)
     dot.className = 'sync-dot ok';
     $('sync-text').textContent = (s.errored > 0)
       ? (s.errored + (s.errored === 1 ? ' arquivo com erro — tentando de novo' : ' arquivos com erro — tentando de novo'))
       : 'Tudo sincronizado';
+    bar.classList.remove('indeterminate');
     bar.classList.add('hidden');
   }
 }

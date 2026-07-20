@@ -263,6 +263,18 @@ input.pin {
   border-radius: 3px;
   transition: width 0.4s ease;
 }
+/* Barra INDETERMINADA: arquivos enfileirados, os bytes ainda não começaram a
+   subir (sem % confiável) → um bloco desliza continuamente, sem o "minuto sem
+   barra". A animação controla a posição; a largura fica fixa. */
+.sync-bar.indeterminate .sync-fill {
+  width: 40%;
+  transition: none;
+  animation: sync-indet 1.2s ease-in-out infinite;
+}
+@keyframes sync-indet {
+  0%   { transform: translateX(-100%); }
+  100% { transform: translateX(250%); }
+}
 
 /* ── pastas fixas (pin) ────────────────────────────────────────────── */
 .pins {

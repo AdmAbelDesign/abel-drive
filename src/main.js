@@ -12,7 +12,7 @@
 // O mount do rclone entra no M6a-2.
 // ══════════════════════════════════════════════════════════════════════
 
-const { app, BrowserWindow, ipcMain, shell, Tray, Menu, nativeImage, dialog } = require('electron');
+const { app, BrowserWindow, ipcMain, shell, Tray, Menu, nativeImage, dialog, powerMonitor } = require('electron');
 const path = require('path');
 const fs = require('fs');
 const crypto = require('crypto');
@@ -53,6 +53,14 @@ let mainWindow = null;
 let tray = null;
 let isQuitting = false;
 let didAutoConnect = false;
+
+// ── Auto-reconexão (saída INESPERADA do rclone: blip de rede, wifi trocado,
+// notebook que dormiu). Backoff exponencial com teto; credencial e cache
+// persistem, então o remount é rápido e o warmPins pula o que já está em cache.
+let reconnectTimer = null;
+let reconnectAttempt = 0;
+const RECONNECT_DELAYS = [3000, 6000, 12000, 30000, 60000]; // ms — teto ~60s
+const RECONNECT_MAX = 6; // nº de tentativas antes de desistir (cai pra manual)
 
 // ── store simples em disco (userData/abel-drive.json) ──────────────────
 function storePath() {
@@ -571,21 +579,76 @@ async function getCredentialSecret() {
     method: 'POST', body: { label: 'Abel Drive' }, withSession: true,
   });
   if (!cred.ok || !cred.data || !cred.data.secret) {
-    return { ok: false, error: cred.error || 'erro' };
+    // Distingue AUTH (401/403 → credencial/sessão inválida) de rede/transitório.
+    // Só auth deve zerar a credencial guardada; rede não.
+    const authFailed = cred._status === 401 || cred._status === 403;
+    return { ok: false, error: cred.error || 'erro', authFailed };
   }
   const expires = cred.data.credential && cred.data.credential.expires_at;
   writeStore({ cred_secret: cred.data.secret, cred_expires: expires || null });
   return { ok: true, secret: cred.data.secret, reused: false };
 }
 
-async function driveConnect() {
+// Cancela qualquer reconexão pendente e zera o contador (saída intencional,
+// mount OK, ou desistência).
+function cancelReconnect() {
+  if (reconnectTimer) { clearTimeout(reconnectTimer); reconnectTimer = null; }
+  reconnectAttempt = 0;
+}
+
+// Agenda a próxima tentativa de reconexão com backoff. Chamado quando o rclone
+// sai SEM ser a pedido. Não descarta credencial (rede ≠ auth) — isso só
+// acontece se a tentativa voltar 401/403 lá em driveConnect.
+function scheduleReconnect() {
+  if (isQuitting) return;
+  if (reconnectAttempt >= RECONNECT_MAX) {
+    // Esgotou o backoff (rede longa demais). Cai pro modo manual, mas mantém a
+    // credencial guardada — não foi auth, foi rede.
+    reconnectAttempt = 0;
+    setMount({ status: 'error', mountPoint: null,
+      message: 'Não consegui reconectar. Clique em Conectar para tentar de novo.' });
+    return;
+  }
+  const delay = RECONNECT_DELAYS[Math.min(reconnectAttempt, RECONNECT_DELAYS.length - 1)];
+  reconnectAttempt++;
+  setMount({ status: 'reconnecting', mountPoint: null,
+    message: 'Reconectando… (tentativa ' + reconnectAttempt + ' de ' + RECONNECT_MAX + ')' });
+  if (reconnectTimer) clearTimeout(reconnectTimer);
+  reconnectTimer = setTimeout(runReconnect, delay);
+}
+
+// Uma tentativa de reconexão. Reusa credencial + cache. Se a credencial voltar
+// 401/403, driveConnect descarta e para o loop (_authFailed). Falha transitória
+// (rede, winfsp, rclone não subiu) reagenda com backoff. Sucesso vira 'mounted'
+// ~3,5s depois (fica 'connecting' no meio-tempo → não reagenda).
+async function runReconnect() {
+  reconnectTimer = null;
+  if (isQuitting || rcloneProc) return;
+  const res = await driveConnect({ reconnecting: true });
+  if (res && res.status === 'error' && !res._authFailed) scheduleReconnect();
+}
+
+async function driveConnect(opts) {
   if (rcloneProc) return mountState;
+  // Numa reconexão a credencial e o cache já existem; só num disparo manual/auto
+  // limpamos o backoff pendente pra recomeçar do zero.
+  if (!opts || !opts.reconnecting) cancelReconnect();
   setMount({ status: 'connecting', message: 'Pegando sua credencial…' });
   // Começa um log limpo por sessão (pra capturar erros do mount).
   try { fs.writeFileSync(logFilePath(), '=== Abel Drive — sessão ' + new Date().toISOString() + ' ===\n'); } catch (_) {}
 
   const c = await getCredentialSecret();
   if (!c.ok) {
+    if (c.authFailed) {
+      // AUTENTICAÇÃO falhou (401/403): agora sim a credencial guardada não vale.
+      // Zera pra gerar uma nova no próximo "Conectar" e para o loop de reconexão.
+      writeStore({ cred_secret: null, cred_expires: null });
+      cancelReconnect();
+      setMount({ status: 'error', mountPoint: null,
+        message: 'Sua credencial expirou. Clique em Conectar para entrar de novo.' });
+      return { ...mountState, _authFailed: true };
+    }
+    // Rede/transitório: mantém a credencial; runReconnect reagenda com backoff.
     setMount({ status: 'error', message: 'Não consegui a credencial (' + c.error + ').' });
     return mountState;
   }
@@ -659,13 +722,15 @@ async function driveConnect() {
     stopSyncPoll();
     stopPinLoop();
     rcAddr = null; rcAuth = null;
-    if (wasIntentional) {
+    if (wasIntentional || isQuitting) {
+      // Saída a pedido (Desconectar) ou app fechando → nada de reconectar.
+      cancelReconnect();
       setMount({ status: 'idle', mountPoint: null, message: '' });
     } else {
-      // Pode ter sido credencial inválida/revogada — descarta a guardada pra
-      // gerar uma nova na próxima tentativa (rede de segurança do reúso).
-      writeStore({ cred_secret: null, cred_expires: null });
-      setMount({ status: 'error', mountPoint: null, message: 'O drive desconectou (código ' + code + ').' });
+      // Saída INESPERADA (blip de rede, wifi trocado, notebook dormiu). NÃO
+      // descarta a credencial — rede ≠ auth. Reconecta com backoff; a credencial
+      // só é zerada se a próxima tentativa voltar 401/403 (em driveConnect).
+      scheduleReconnect();
     }
   });
 
@@ -673,6 +738,7 @@ async function driveConnect() {
   // consideramos montado.
   setTimeout(() => {
     if (rcloneProc) {
+      reconnectAttempt = 0; // montou de novo → zera o backoff da reconexão
       setMount({ status: 'mounted', mountPoint, message: 'Conectado' });
       startSyncPoll();
       warmPins();          // baixa o conteúdo das pastas fixas
@@ -711,7 +777,7 @@ function showWindow() {
 function buildTrayMenu() {
   const st = mountState.status;
   const mounted = st === 'mounted';
-  const busy = st === 'connecting' || st === 'disconnecting';
+  const busy = st === 'connecting' || st === 'disconnecting' || st === 'reconnecting';
   const openAtLogin = app.getLoginItemSettings().openAtLogin;
   return Menu.buildFromTemplate([
     { label: mounted ? 'Drive conectado (' + (mountState.mountPoint || 'Z:') + ')' : 'Drive desconectado', enabled: false },
@@ -723,7 +789,7 @@ function buildTrayMenu() {
     { type: 'separator' },
     mounted
       ? { label: 'Desconectar', click: () => driveDisconnect() }
-      : { label: busy ? 'Conectando…' : 'Conectar meu drive', enabled: !busy, click: () => driveConnect() },
+      : { label: busy ? (st === 'reconnecting' ? 'Reconectando…' : 'Conectando…') : 'Conectar meu drive', enabled: !busy, click: () => driveConnect() },
     { type: 'separator' },
     { label: 'Iniciar com o Windows', type: 'checkbox', checked: openAtLogin,
       click: (item) => app.setLoginItemSettings({ openAtLogin: item.checked }) },
@@ -838,6 +904,23 @@ app.whenReady().then(() => {
   createWindow();
   createTray();
   initAutoUpdate();
+
+  // Notebook acordou: se estávamos reconectando (ou já caímos pra erro por
+  // rede), tenta AGORA em vez de esperar o backoff. Não quebra se powerMonitor
+  // não existir na plataforma.
+  try {
+    if (powerMonitor && typeof powerMonitor.on === 'function') {
+      powerMonitor.on('resume', () => {
+        if (isQuitting || rcloneProc) return;
+        if (mountState.status === 'reconnecting' || mountState.status === 'error') {
+          if (reconnectTimer) { clearTimeout(reconnectTimer); reconnectTimer = null; }
+          reconnectAttempt = 0;
+          runReconnect();
+        }
+      });
+    }
+  } catch (_) {}
+
   app.on('activate', () => {
     if (BrowserWindow.getAllWindows().length === 0) createWindow();
   });
