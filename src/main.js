@@ -514,10 +514,16 @@ function runWinfspInstaller(msi) {
 async function ensureWinFsp() {
   if (winfspInstalled()) return { ok: true };
   const msi = winfspInstallerPath();
+  // Build sem o instalador bundlado (asset ausente / pacote antigo) → manual.
   if (!msi) return { ok: false, error: 'Falta o WinFsp. Instale-o em winfsp.dev e conecte de novo.' };
-  setMount({ status: 'connecting', message: 'Instalando o WinFsp (permita a alteração)…' });
+  // Msi presente + driver ausente → auto-instala (UAC aparece uma vez). Ao
+  // concluir, ensureWinFsp devolve ok e o driveConnect SEGUE pro mount sozinho.
+  setMount({ status: 'connecting', message: 'Instalando o WinFsp — aceite o pedido de permissão do Windows…' });
   await runWinfspInstaller(msi);
-  if (!winfspInstalled()) return { ok: false, error: 'A instalação do WinFsp não concluiu. Tente de novo.' };
+  // Recusou o UAC ou o install falhou → acionável e sem loop (mantém o link).
+  if (!winfspInstalled()) {
+    return { ok: false, error: 'Não consegui instalar o WinFsp automaticamente. Baixe em winfsp.dev, instale e clique em Conectar.' };
+  }
   return { ok: true };
 }
 

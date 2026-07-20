@@ -40,3 +40,18 @@ A sessão fica guardada, então da próxima vez abre já conectado (use **Sair**
 - A API usada é a de produção (`ecossistema-abel-production.up.railway.app`).
 - `device_id`, sessão e perfil ficam em `%APPDATA%/abel-drive/abel-drive.json`.
 - Nada de senha é guardado — o login é por código de uso único.
+
+## WinFsp bundlado (Windows)
+
+O rclone precisa do driver **WinFsp** para montar o drive no Windows. Para não
+depender de instalação manual em máquina nova, o instalador é **empacotado** com o
+app em `bin/winfsp.msi` e auto-instalado (com UAC) na primeira conexão quando o
+driver ainda não existe — ver `ensureWinFsp()` em `src/main.js`.
+
+- O `bin/` inteiro vai pro pacote via `extraResources` (`package.json` → `build`),
+  landando em `resources/bin/winfsp.msi`; é onde `winfspInstallerPath()` procura em
+  produção (em dev procura em `../bin`).
+- **Origem/licença:** WinFsp é redistribuível (mesma prática do rclone/Mountain
+  Duck). Instalador baixado de https://winfsp.dev — versão **`<preencher: ex. 2.0 (Bento)`** *(anote aqui a versão exata baixada ao adicionar o `bin/winfsp.msi`)*.
+- Para atualizar: baixe o novo `.msi` de winfsp.dev, salve **exatamente** como
+  `bin/winfsp.msi` e atualize a versão acima.
