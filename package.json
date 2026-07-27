@@ -9,7 +9,7 @@
   "scripts": {
     "start": "electron .",
     "dist": "electron-builder --win",
-    "dist:mac": "electron-builder --mac"
+    "dist:mac": "electron-builder --mac --universal"
   },
   "dependencies": {
     "electron-updater": "^6.1.8"
