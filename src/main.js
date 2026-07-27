@@ -740,12 +740,6 @@ async function driveConnect(opts) {
     '--rc-user', rcAuth.user,
     '--rc-pass', rcAuth.pass,
   ];
-  // Mac (macFUSE): sem `-o local` o Finder às vezes não desenha o conteúdo (o
-  // `ls` lista certo, mas a janela fica vazia). `local` apresenta como disco
-  // local → o Finder passa a listar na hora, sempre (essencial pro usuário
-  // final não achar que quebrou). `noappledouble` corta os arquivos `._*`
-  // (metade do lixo de .DS_Store que tomava o log com 403).
-  if (IS_MAC) { args.push('-o', 'local', '-o', 'noappledouble'); }
   rcloneProc = spawn(rclonePath(), args, { windowsHide: true });
   rcloneProc.stdout.on('data', handleRcloneLog);
   rcloneProc.stderr.on('data', handleRcloneLog);
@@ -777,6 +771,11 @@ async function driveConnect(opts) {
     if (rcloneProc) {
       reconnectAttempt = 0; // montou de novo → zera o backoff da reconexão
       setMount({ status: 'mounted', mountPoint, message: 'Conectado' });
+      // Pré-lê a raiz do drive pra "esquentar" a listagem no cache do rclone —
+      // assim o Finder/Explorer já abre mostrando as coleções, reduzindo a
+      // janela vazia / a demora na 1ª abertura no Mac. Best-effort: não bloqueia
+      // e NÃO mexe em opção de mount (sem o risco que o `-o local` trouxe).
+      fs.promises.readdir(mountPoint).catch(() => {});
       startSyncPoll();
       warmPins();          // baixa o conteúdo das pastas fixas
       refreshPinnedDirs(); // e pré-aquece a listagem delas (navegar = instantâneo)
