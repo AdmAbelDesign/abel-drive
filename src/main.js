@@ -479,8 +479,25 @@ function openMount() {
 
 // ── WinFsp (driver que o rclone precisa pra montar drive no Windows) ────
 // No Mac o equivalente é o FUSE-T (instalado à parte pelo usuário).
+
+// Mac: precisa de um provedor FUSE — FUSE-T (userspace, SEM kext, recomendado
+// e melhor no Apple Silicon/versões novas) ou macFUSE. Detecta pelos arquivos
+// que cada um instala. Sem provedor, o rclone falha com "failed to mount FUSE
+// fs" — que era exatamente o erro no Mac da Raquel (o stub antigo devolvia
+// `true` cegamente, então o app nem avisava a causa).
+function macFuseAvailable() {
+  const markers = [
+    '/usr/local/lib/libfuse-t.dylib',       // FUSE-T
+    '/usr/local/lib/libfuse-t.2.dylib',     // FUSE-T
+    '/Library/Application Support/fuse-t',   // FUSE-T
+    '/Library/Filesystems/macfuse.fs',       // macFUSE
+    '/usr/local/lib/libosxfuse.2.dylib',     // macFUSE (antigo)
+  ];
+  return markers.some((p) => { try { return fs.existsSync(p); } catch (_) { return false; } });
+}
+
 function winfspInstalled() {
-  if (IS_MAC) return true;
+  if (IS_MAC) return macFuseAvailable();
   try {
     // A chave de registro do WinFsp existe quando ele está instalado.
     require('child_process').execFileSync(
@@ -513,6 +530,10 @@ function runWinfspInstaller(msi) {
 // instala (com UAC). Se faltar e não tiver embutido, orienta o usuário.
 async function ensureWinFsp() {
   if (winfspInstalled()) return { ok: true };
+  if (IS_MAC) {
+    // Sem FUSE no Mac não dá pra montar. Orienta e para (sem loop).
+    return { ok: false, error: 'Falta o FUSE para o Mac. Instale o FUSE-T (fuse-t.github.io) e clique em Conectar de novo.' };
+  }
   const msi = winfspInstallerPath();
   // Build sem o instalador bundlado (asset ausente / pacote antigo) → manual.
   if (!msi) return { ok: false, error: 'Falta o WinFsp. Instale-o em winfsp.dev e conecte de novo.' };
@@ -677,6 +698,10 @@ async function driveConnect(opts) {
 
   setMount({ status: 'connecting', message: 'Montando o drive…' });
   const mountPoint = resolveMountPoint();
+  // Mac: o rclone monta numa PASTA (~/Abel Drive) que precisa EXISTIR antes.
+  // No Windows é uma letra de drive (não precisa criar). Sem isso o rclone
+  // falhava com "stat ~/Abel Drive: no such file or directory".
+  if (IS_MAC) { try { fs.mkdirSync(mountPoint, { recursive: true }); } catch (_) {} }
   // Cache PRÓPRIO do app (isolado do rclone manual, evita colisão de cache).
   const cacheDir = path.join(app.getPath('userData'), 'rclone-cache');
   try { fs.mkdirSync(cacheDir, { recursive: true }); } catch (_) {}
@@ -814,7 +839,11 @@ function refreshTray() {
 
 function createTray() {
   if (tray) return;
-  const icon = nativeImage.createFromPath(path.join(__dirname, '..', 'build', 'icon.png'));
+  const raw = nativeImage.createFromPath(path.join(__dirname, '..', 'build', 'icon.png'));
+  // Mac: o ícone vai pra BARRA DE MENU (topo) e precisa ser pequeno (~18px),
+  // senão renderiza gigante/quebrado — foi o "erro na barra superior" do Mac.
+  // Windows usa a bandeja, onde o tamanho cheio fica ok.
+  const icon = (!raw.isEmpty() && IS_MAC) ? raw.resize({ width: 18, height: 18 }) : raw;
   tray = new Tray(icon.isEmpty() ? nativeImage.createEmpty() : icon);
   tray.on('click', showWindow);        // clique simples abre a janela
   tray.on('double-click', showWindow);

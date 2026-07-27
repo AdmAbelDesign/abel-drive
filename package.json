@@ -1,6 +1,6 @@
 {
   "name": "abel-drive",
-  "version": "0.1.19",
+  "version": "0.1.18",
   "description": "Abel Drive — acesso aos arquivos do Ecossistema Abel como um drive no computador.",
   "author": "Abel Design",
   "license": "UNLICENSED",
@@ -45,7 +45,7 @@
       "shortcutName": "Abel Drive"
     },
     "mac": {
-      "target": "dmg",
+      "target": ["dmg", "zip"],
       "icon": "build/icon.png",
       "category": "public.app-category.productivity",
       "identity": null
