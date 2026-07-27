@@ -740,6 +740,12 @@ async function driveConnect(opts) {
     '--rc-user', rcAuth.user,
     '--rc-pass', rcAuth.pass,
   ];
+  // Mac (macFUSE): sem `-o local` o Finder às vezes não desenha o conteúdo (o
+  // `ls` lista certo, mas a janela fica vazia). `local` apresenta como disco
+  // local → o Finder passa a listar na hora, sempre (essencial pro usuário
+  // final não achar que quebrou). `noappledouble` corta os arquivos `._*`
+  // (metade do lixo de .DS_Store que tomava o log com 403).
+  if (IS_MAC) { args.push('-o', 'local', '-o', 'noappledouble'); }
   rcloneProc = spawn(rclonePath(), args, { windowsHide: true });
   rcloneProc.stdout.on('data', handleRcloneLog);
   rcloneProc.stderr.on('data', handleRcloneLog);
