@@ -29,13 +29,14 @@
       "build/icon.png",
       "package.json"
     ],
-    "extraResources": [
-      { "from": "bin", "to": "bin", "filter": ["**/*"] }
-    ],
     "win": {
       "target": "nsis",
       "icon": "build/icon.ico",
-      "artifactName": "Abel-Drive-Setup-${version}.${ext}"
+      "artifactName": "Abel-Drive-Setup-${version}.${ext}",
+      "extraResources": [
+        { "from": "bin/rclone.exe", "to": "bin/rclone.exe" },
+        { "from": "bin/winfsp.msi", "to": "bin/winfsp.msi" }
+      ]
     },
     "nsis": {
       "oneClick": false,
@@ -48,7 +49,11 @@
       "target": ["dmg", "zip"],
       "icon": "build/icon.png",
       "category": "public.app-category.productivity",
-      "identity": null
+      "identity": null,
+      "extraResources": [
+        { "from": "bin/rclone", "to": "bin/rclone" }
+      ],
+      "x64ArchFiles": "**/rclone"
     }
   }
 }
