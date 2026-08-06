@@ -12,7 +12,7 @@
 // O mount do rclone entra no M6a-2.
 // ══════════════════════════════════════════════════════════════════════
 
-const { app, BrowserWindow, ipcMain, shell, Tray, Menu, nativeImage, dialog, powerMonitor } = require('electron');
+const { app, BrowserWindow, ipcMain, shell, Tray, Menu, nativeImage, dialog, powerMonitor, Notification } = require('electron');
 const path = require('path');
 const fs = require('fs');
 const crypto = require('crypto');
@@ -168,6 +168,23 @@ let syncTimer = null;
 const SYNC_ZERO = { state: 'idle', pending: 0, transfers: 0, percent: null, speed: 0, errored: 0 };
 let syncState = { ...SYNC_ZERO };
 
+// Notificacao do Windows quando um envio comeca/termina (estilo Mountain Duck).
+// Dispara so na virada synced->uploading e uploading->synced (nao a cada poll).
+let _uploadEpisode = false;
+function maybeNotifyUpload(isUploading, firstName) {
+  try {
+    if (Notification && Notification.isSupported && !Notification.isSupported()) return;
+    if (!_uploadEpisode && isUploading) {
+      _uploadEpisode = true;
+      const body = firstName ? ('Enviando: ' + firstName) : 'Enviando arquivos para o Abel Drive...';
+      new Notification({ title: 'Abel Drive', body, silent: true }).show();
+    } else if (_uploadEpisode && !isUploading) {
+      _uploadEpisode = false;
+      new Notification({ title: 'Abel Drive', body: 'Tudo sincronizado', silent: true }).show();
+    }
+  } catch (_) { /* notificacao e best-effort */ }
+}
+
 // Acha uma porta TCP livre no loopback (evita colisão com outro rclone/serviço).
 function getFreePort() {
   return new Promise((resolve) => {
@@ -230,6 +247,7 @@ async function pollSyncOnce() {
   for (const t of transferring) { sumBytes += Number(t.bytes || 0); sumSize += Number(t.size || 0); }
   const percent = sumSize > 0 ? Math.min(100, Math.round((sumBytes / sumSize) * 100)) : null;
   const uploading = pending > 0 || transferring.length > 0;
+  maybeNotifyUpload(uploading, transferring[0] && transferring[0].name);
   setSync({
     state: uploading ? 'uploading' : 'synced',
     pending,
@@ -798,6 +816,18 @@ ipcMain.handle('drive:disconnect', () => driveDisconnect());
 ipcMain.handle('drive:status', () => mountState);
 ipcMain.handle('drive:syncState', () => syncState);
 ipcMain.handle('drive:open', () => { openMount(); return { ok: true }; });
+
+// Forca o drive a largar a lista de pastas em cache e reler do servidor agora.
+// E o conserto do "vejo Tudo sincronizado mas falta arquivo": o WebDAV nao
+// avisa mudancas de fora, entao a listagem fica velha ate isso rodar.
+ipcMain.handle('drive:refresh', async () => {
+  if (mountState.status !== 'mounted') return { ok: false, error: 'Conecte o drive primeiro.' };
+  await rcCall('vfs/forget', {});
+  await rcCall('vfs/refresh', { recursive: 'false' });
+  refreshPinnedDirs();
+  await pollSyncOnce();
+  return { ok: true, pending: syncState.pending, uploading: syncState.state === 'uploading' };
+});
 
 // ══════════════════════════════════════════════════════════════════════
 // BANDEJA (system tray) + auto-conectar + iniciar com o Windows

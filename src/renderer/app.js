@@ -160,10 +160,12 @@ function renderDrive(s) {
     btn.textContent = 'Desconectar';
     btn.classList.remove('btn-primary'); btn.classList.add('btn-ghost');
     $('btn-drive-open').classList.remove('hidden');
+    $('btn-drive-refresh').classList.remove('hidden');
   } else {
     btn.textContent = 'Conectar meu drive';
     btn.classList.add('btn-primary'); btn.classList.remove('btn-ghost');
     $('btn-drive-open').classList.add('hidden');
+    $('btn-drive-refresh').classList.add('hidden');
   }
 }
 
@@ -289,6 +291,24 @@ function renderSync(s) {
   }
 }
 
+async function doRefresh() {
+  const btn = $('btn-drive-refresh');
+  busy(btn, true);
+  try {
+    const r = await window.abel.driveRefresh();
+    if (r && r.ok) {
+      showToast({ kind: 'info', text: r.pending > 0
+        ? ('Lista atualizada. Ainda enviando ' + r.pending + (r.pending === 1 ? ' arquivo' : ' arquivos') + '...')
+        : 'Lista atualizada! Se uma pasta estava aberta no Explorer, aperte F5 nela pra ver os arquivos novos.' });
+    } else {
+      showToast({ kind: 'warn', text: (r && r.error) || 'Nao consegui atualizar agora.' });
+    }
+  } catch (_) {
+    showToast({ kind: 'warn', text: 'Nao consegui atualizar agora.' });
+  }
+  busy(btn, false);
+}
+
 async function toggleDrive() {
   const s = await window.abel.driveStatus();
   if (s && s.status === 'mounted') await window.abel.driveDisconnect();
@@ -349,6 +369,7 @@ window.addEventListener('DOMContentLoaded', async () => {
 
   $('btn-drive').onclick = toggleDrive;
   $('btn-drive-open').onclick = () => window.abel.driveOpen();
+  $('btn-drive-refresh').onclick = doRefresh;
   window.abel.onDriveState(renderDrive);
   window.abel.onDriveToast(showToast);
   window.abel.onDriveSync(renderSync);

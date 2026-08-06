@@ -20,6 +20,7 @@ contextBridge.exposeInMainWorld('abel', {
   driveStatus:     () => ipcRenderer.invoke('drive:status'),
   driveSyncState:  () => ipcRenderer.invoke('drive:syncState'),
   driveOpen:       () => ipcRenderer.invoke('drive:open'),
+  driveRefresh:    () => ipcRenderer.invoke('drive:refresh'),
 
   // Pastas fixas (pin)
   pinsList:  () => ipcRenderer.invoke('pins:list'),
