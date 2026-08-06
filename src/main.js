@@ -822,9 +822,18 @@ ipcMain.handle('drive:open', () => { openMount(); return { ok: true }; });
 // avisa mudancas de fora, entao a listagem fica velha ate isso rodar.
 ipcMain.handle('drive:refresh', async () => {
   if (mountState.status !== 'mounted') return { ok: false, error: 'Conecte o drive primeiro.' };
-  await rcCall('vfs/forget', {});
-  await rcCall('vfs/refresh', { recursive: 'false' });
-  refreshPinnedDirs();
+  // Atualiza a LISTAGEM relendo do servidor, SEM despejar o cache inteiro.
+  //
+  // ANTES chamava `vfs/forget {}` sem alvo: isso manda o rclone esquecer TODO o
+  // cache (listagens E arquivos ja baixados, inclusive as pastas fixas). Depois
+  // de um clique, o drive inteiro fica "frio" — cada navegacao/abertura/salvamento
+  // volta a bater no servidor pela internet -> tudo lento. Era a causa da lentidao.
+  //
+  // `vfs/refresh` re-le a pasta do servidor e ja detecta arquivo novo/substituido
+  // (fingerprint por mtime+tamanho), mantendo o que ja esta em cache. Fazemos a
+  // raiz (rapido) + as pastas fixas (recursivo), que sao a area de trabalho real.
+  await rcCall('vfs/refresh', { recursive: 'false' });   // raiz — rapido
+  refreshPinnedDirs();                                   // pastas fixas — recursivo
   await pollSyncOnce();
   return { ok: true, pending: syncState.pending, uploading: syncState.state === 'uploading' };
 });
