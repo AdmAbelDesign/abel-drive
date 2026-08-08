@@ -20,10 +20,10 @@ const { spawn, execFile } = require('child_process');
 const os = require('os');
 const net = require('net');
 
-// Base da API do Ecossistema (mesmo backend do /webdav validado no teste).
-const API_BASE = 'https://ecossistema-abel-production.up.railway.app/api';
+// Base da API do Ecossistema (backend no Fly.io / São Paulo, via domínio próprio).
+const API_BASE = 'https://api.ecossistemaabel.com.br/api';
 // Raiz do gateway WebDAV (lista as coleções que o usuário pode ver).
-const WEBDAV_URL = 'https://ecossistema-abel-production.up.railway.app/webdav';
+const WEBDAV_URL = 'https://api.ecossistemaabel.com.br/webdav';
 
 const IS_MAC = process.platform === 'darwin';
 // Binário do rclone por plataforma (empacotado em bin/).
@@ -266,6 +266,61 @@ function startSyncPoll() {
 function stopSyncPoll() {
   if (syncTimer) { clearInterval(syncTimer); syncTimer = null; }
   setSync({ ...SYNC_ZERO });
+}
+
+// ══════════════════════════════════════════════════════════════════════
+// AUTO-REFRESH — arquivo novo do colega aparece SOZINHO (sem clicar Atualizar)
+// ----------------------------------------------------------------------
+// O WebDAV nao avisa mudancas de fora, e o dir-cache do rclone e agressivo
+// (1000h). Entao, de tempos em tempos, perguntamos ao servidor "o que mudou
+// desde a ultima vez?" (GET /api/vfs/changes). Ele devolve so as PASTAS que
+// mudaram, no caminho de EXIBICAO do mount — e damos vfs/refresh em cada uma.
+// Leve: numa janela tipica muda 1-2 pastas; refresh de 1 pasta e barato e NAO
+// mexe no cache dos arquivos ja baixados (as fixas continuam quentes).
+const CHANGES_POLL_MS = 45000;      // pergunta a cada 45s
+const CHANGES_OVERLAP_MS = 30000;   // recuo de seguranca (skew/commit atrasado)
+let changesTimer = null;
+let changesSince = null;
+let changesBusy = false;
+
+async function pollChangesOnce() {
+  if (changesBusy || !rcloneProc || mountState.status !== 'mounted') return;
+  changesBusy = true;
+  try {
+    const since = changesSince || new Date(Date.now() - 60000).toISOString();
+    const out = await api('/vfs/changes?since=' + encodeURIComponent(since), { method: 'GET', withSession: true });
+    if (!out || out.ok !== true) return;   // rede/sessao: tenta no proximo ciclo
+    // Avanca o marcador COM RECUO — refresh repetido e barato; perder mudanca nao.
+    if (out.now) {
+      const t = Date.parse(out.now);
+      changesSince = isFinite(t) ? new Date(t - CHANGES_OVERLAP_MS).toISOString() : since;
+    }
+    const dirs = Array.isArray(out.dirs) ? out.dirs : [];
+    if (dirs.length === 0) return;
+    pinLog('changes: ' + dirs.length + ' pasta(s) mudaram — atualizando listagem');
+    let refreshRoot = false;
+    for (const d of dirs) {
+      if (!rcloneProc) break;
+      if (d === '' || d === '/') { refreshRoot = true; continue; }
+      await rcCall('vfs/refresh', { dir: String(d).replace(/\\/g, '/'), recursive: 'false' });
+    }
+    if (refreshRoot) await rcCall('vfs/refresh', { recursive: 'false' });
+    await pollSyncOnce();
+  } catch (_) { /* best-effort: nunca derruba o app */ }
+  finally { changesBusy = false; }
+}
+
+function startChangesPoll() {
+  stopChangesPoll();
+  // Ao conectar o mount ja mostra o estado atual (dir-cache novo); o poller so
+  // precisa pegar o que mudar DAQUI PRA FRENTE — comeca no ultimo minuto.
+  changesSince = new Date(Date.now() - 60000).toISOString();
+  changesTimer = setInterval(pollChangesOnce, CHANGES_POLL_MS);
+  setTimeout(pollChangesOnce, 5000);   // 1a sondagem logo apos montar (RC ja subiu)
+}
+function stopChangesPoll() {
+  if (changesTimer) { clearInterval(changesTimer); changesTimer = null; }
+  changesBusy = false;
 }
 
 // ══════════════════════════════════════════════════════════════════════
@@ -770,6 +825,7 @@ async function driveConnect(opts) {
     rcloneProc = null;
     stopSyncPoll();
     stopPinLoop();
+    stopChangesPoll();
     rcAddr = null; rcAuth = null;
     if (wasIntentional || isQuitting) {
       // Saída a pedido (Desconectar) ou app fechando → nada de reconectar.
@@ -798,6 +854,7 @@ async function driveConnect(opts) {
       warmPins();          // baixa o conteúdo das pastas fixas
       refreshPinnedDirs(); // e pré-aquece a listagem delas (navegar = instantâneo)
       startPinLoop();      // re-aquece periodicamente
+      startChangesPoll();  // auto-refresh: arquivo novo do colega aparece sozinho
     }
   }, 3500);
 
