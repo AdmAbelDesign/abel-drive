@@ -134,7 +134,7 @@ function renderDrive(s) {
   lastDriveStatus = st;
   if (st !== 'mounted') { $('drive-sync').classList.add('hidden'); $('pins').classList.add('hidden'); }
   // Nova tentativa de conexão limpa o último erro mostrado.
-  if (st === 'connecting') $('drive-error').className = 'drive-error hidden';
+  if (st === 'connecting' || st === 'mounted') $('drive-error').className = 'drive-error hidden';
   const dot = $('drive-dot');
   dot.className = 'drive-dot' + (
     st === 'mounted' ? ' on' :
@@ -315,6 +315,12 @@ async function toggleDrive() {
   else await window.abel.driveConnect();
 }
 
+// ── avisos: balão + linha dispensável (✕) + histórico ("central de avisos") ──
+const avisosHist = [];
+let avisosOpen = false;
+function _p2(n) { return n < 10 ? '0' + n : '' + n; }
+function _hm() { const d = new Date(); return _p2(d.getHours()) + ':' + _p2(d.getMinutes()); }
+
 let toastTimer = null;
 function showToast(t) {
   const el = $('toast');
@@ -322,14 +328,39 @@ function showToast(t) {
   el.className = 'toast ' + (t.kind || 'info');
   clearTimeout(toastTimer);
   toastTimer = setTimeout(() => { el.className = 'toast hidden'; }, 6000);
-  // Persiste erros/avisos numa linha fixa embaixo do status (o balão some rápido,
-  // isso fica até reconectar).
+  // Erros/avisos: linha fixa embaixo do status, agora DISPENSÁVEL (✕), e guardada
+  // num histórico pra você poder ver depois sem ficar com a tela suja.
   if (t.kind === 'error' || t.kind === 'warn') {
-    const err = $('drive-error');
-    err.textContent = t.text;
-    err.className = 'drive-error show' + (t.kind === 'warn' ? ' warn' : '');
+    avisosHist.unshift({ kind: t.kind, text: t.text, at: _hm() });
+    if (avisosHist.length > 30) avisosHist.length = 30;
+    $('drive-error-text').textContent = t.text;
+    $('drive-error').className = 'drive-error show' + (t.kind === 'warn' ? ' warn' : '');
+    renderAvisos();
   }
 }
+
+function dismissDriveError() { $('drive-error').className = 'drive-error hidden'; }
+
+function renderAvisos() {
+  const btn = $('btn-avisos');
+  const list = $('avisos-list');
+  if (avisosHist.length === 0) { btn.classList.add('hidden'); list.classList.add('hidden'); avisosOpen = false; return; }
+  btn.classList.remove('hidden');
+  btn.textContent = (avisosOpen ? 'Ocultar avisos' : 'Avisos') + ' (' + avisosHist.length + ')';
+  if (!avisosOpen) { list.classList.add('hidden'); return; }
+  list.textContent = '';
+  for (const a of avisosHist) {
+    const row = document.createElement('div');
+    row.className = 'aviso-item ' + (a.kind === 'warn' ? 'warn' : 'error');
+    const time = document.createElement('span'); time.className = 'aviso-time'; time.textContent = a.at;
+    const txt = document.createElement('span'); txt.className = 'aviso-text'; txt.textContent = a.text;
+    row.appendChild(time); row.appendChild(txt);
+    list.appendChild(row);
+  }
+  list.classList.remove('hidden');
+}
+
+function toggleAvisos() { avisosOpen = !avisosOpen; renderAvisos(); }
 
 // ── Atualização ────────────────────────────────────────────────────────
 function renderUpdate(s) {
@@ -370,6 +401,8 @@ window.addEventListener('DOMContentLoaded', async () => {
   $('btn-drive').onclick = toggleDrive;
   $('btn-drive-open').onclick = () => window.abel.driveOpen();
   $('btn-drive-refresh').onclick = doRefresh;
+  $('drive-error-x').onclick = dismissDriveError;
+  $('btn-avisos').onclick = toggleAvisos;
   window.abel.onDriveState(renderDrive);
   window.abel.onDriveToast(showToast);
   window.abel.onDriveSync(renderSync);

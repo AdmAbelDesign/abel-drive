@@ -658,7 +658,7 @@ function handleRcloneLog(text) {
     if (/\b423\b|Locked/i.test(line)) {
       toast('warn', 'Um arquivo está em uso por outra pessoa — sua alteração não foi salva no servidor. Feche sem salvar.');
     } else if (/ERROR/i.test(line) &&
-               !/symlinks not supported|ListJSON|directory not found|context canceled|operations\/list/i.test(line)) {
+               !/symlinks not supported|ListJSON|directory not found|context canceled|operations\/list|502|Bad Gateway/i.test(line)) {
       // Erros de listagem/timeout são ruído da sondagem do pin — não alarmam.
       toast('error', 'Problema no drive: ' + line.replace(/^.*ERROR\s*:?\s*/i, '').slice(0, 140));
     }
@@ -896,6 +896,417 @@ ipcMain.handle('drive:refresh', async () => {
 });
 
 // ══════════════════════════════════════════════════════════════════════
+// SINCRONIZAÇÃO (Abel Drive 2.0 — Fase 1): "Deixar um livro no computador"
+// ----------------------------------------------------------------------
+// Baixa a pasta INTEIRA (conferindo cada arquivo) pra uma pasta local de
+// verdade em Documentos/Abel Drive, mantém em dia pelo /changes e sobrevive a
+// reiniciar. ADITIVO: não mexe no mount nem na tela. UI mínima pela bandeja +
+// diálogos nativos (a tela bonita entra numa fase posterior).
+// ══════════════════════════════════════════════════════════════════════
+
+const SYNC_CONC = 6;
+let syncBusy = false;
+let syncProgress = null;   // { book, done, total, bytesDone, bytesTotal, errors }
+let syncUpdTimer = null;
+
+function syncRootDir() { return path.join(app.getPath('documents'), 'Abel Drive'); }
+function syncLocalDirFor(displayPath) { return path.join(syncRootDir(), ...String(displayPath).split('/')); }
+function humanBytes(b) { b = Number(b) || 0; return b >= 1e9 ? (b / 1e9).toFixed(1) + ' GB' : b >= 1e6 ? (b / 1e6).toFixed(0) + ' MB' : Math.max(1, Math.round(b / 1e3)) + ' KB'; }
+function apiGet(pathname) { return api(pathname, { method: 'GET', withSession: true }); }
+
+// Linha rica de progresso do download: % + tamanho + tempo estimado.
+function syncProgressLine() {
+  if (!syncProgress) return '';
+  const p = syncProgress;
+  const pct = p.total ? Math.round((p.done / p.total) * 100) : 0;
+  let eta = '';
+  const elapsed = (Date.now() - (p.startAt || Date.now())) / 1000;
+  if (elapsed > 3 && p.bytesDone > 0 && p.bytesTotal > 0) {
+    const rate = p.bytesDone / elapsed;
+    const remain = Math.max(0, p.bytesTotal - p.bytesDone);
+    const secs = rate > 0 ? remain / rate : 0;
+    eta = secs > 90 ? ' · ~' + Math.round(secs / 60) + ' min' : ' · ~' + Math.max(1, Math.round(secs)) + ' s';
+  }
+  return p.book + ' — ' + pct + '% · ' + humanBytes(p.bytesDone) + '/' + humanBytes(p.bytesTotal) + eta;
+}
+
+// Espaço livre no volume de destino (sobe até um diretório que exista).
+function freeBytesAt(dir) {
+  try {
+    let probe = dir;
+    while (probe && !fs.existsSync(probe)) { const up = path.dirname(probe); if (up === probe) break; probe = up; }
+    const st = fs.statfsSync(probe);
+    return st.bavail * st.bsize;
+  } catch (_) { return null; }
+}
+
+// Mede um livro/pasta (via /manifest): total de bytes + lista de arquivos.
+async function syncMeasure(displayPath) {
+  const m = await apiGet('/vfs/manifest?path=' + encodeURIComponent(displayPath));
+  if (!m || m.ok !== true) return { ok: false, error: (m && (m.error || m.message)) || 'ERRO' };
+  return { ok: true, total_bytes: m.total_bytes, file_count: m.file_count, files: m.files || [], collection: m.collection, base_phys: m.base_phys };
+}
+
+// ── baseline por arquivo (sidecar .abel-sync.json no livro) — sustenta a
+//    detecção de edição/conflito da Fase 3 ────────────────────────────────
+function syncSidecarPath(localDir) { return path.join(localDir, '.abel-sync.json'); }
+async function saveSidecar(localDir, sc) { try { await fs.promises.writeFile(syncSidecarPath(localDir), JSON.stringify(sc), 'utf8'); } catch (_) {} }
+async function loadSidecar(localDir) { try { return JSON.parse(await fs.promises.readFile(syncSidecarPath(localDir), 'utf8')); } catch (_) { return null; } }
+
+// Baixa 1 arquivo (segue o 302 pro link assinado) conferindo o tamanho. Grava
+// em .part e só renomeia pro nome final DEPOIS de conferir — nunca deixa um
+// arquivo pela metade com o nome real (é o que mata a imagem em branco).
+async function downloadBlob(blobKey, destPath, expectedSize) {
+  // Re-tenta erros transitórios (rede, 5xx do gateway, escrita, tamanho) com um
+  // respiro crescente. Erro definitivo (ex.: 404) não insiste. É o que endurece
+  // contra os "502" que a gente diagnosticou.
+  for (let attempt = 0; attempt < 3; attempt++) {
+    const r = await downloadBlobOnce(blobKey, destPath, expectedSize);
+    if (r.ok) return r;
+    const transient = r.error === 'NETWORK' || r.error === 'WRITE' || r.error === 'SIZE_MISMATCH' || /^HTTP_5/.test(String(r.error));
+    if (!transient) return r;
+    await new Promise((res) => setTimeout(res, 400 * (attempt + 1)));
+  }
+  return { ok: false, error: 'RETRY_EXHAUSTED' };
+}
+
+async function downloadBlobOnce(blobKey, destPath, expectedSize) {
+  const s = readStore();
+  const headers = {};
+  if (s.session_id) headers['x-session-id'] = s.session_id;
+  let res;
+  try { res = await fetch(API_BASE + '/vfs/blob?key=' + encodeURIComponent(blobKey), { headers }); }
+  catch (_) { return { ok: false, error: 'NETWORK' }; }
+  if (!res.ok || !res.body) return { ok: false, error: 'HTTP_' + res.status };
+  try { await fs.promises.mkdir(path.dirname(destPath), { recursive: true }); } catch (_) {}
+  const tmp = destPath + '.part';
+  try {
+    const { Readable } = require('stream');
+    await new Promise((resolve, reject) => {
+      const out = fs.createWriteStream(tmp);
+      Readable.fromWeb(res.body).pipe(out);
+      out.on('finish', resolve);
+      out.on('error', reject);
+    });
+  } catch (_) { try { fs.unlinkSync(tmp); } catch (_) {} return { ok: false, error: 'WRITE' }; }
+  try {
+    const st = await fs.promises.stat(tmp);
+    if (expectedSize != null && st.size !== Number(expectedSize)) { try { fs.unlinkSync(tmp); } catch (_) {} return { ok: false, error: 'SIZE_MISMATCH' }; }
+    await fs.promises.rename(tmp, destPath);
+    return { ok: true, size: st.size };
+  } catch (_) { try { fs.unlinkSync(tmp); } catch (_) {} return { ok: false, error: 'VERIFY' }; }
+}
+
+// Baixa o livro inteiro (N em paralelo). Pula o que já está com o tamanho certo
+// (retomar/re-sync é barato). prune=true apaga local o que não existe mais.
+async function syncDownload(displayPath, manifest, { prune = false, protectAfterMs = 0 } = {}) {
+  if (syncBusy) return { ok: false, error: 'BUSY' };
+  syncBusy = true;
+  const localDir = syncLocalDirFor(displayPath);
+  const files = manifest.files || [];
+  syncProgress = { book: displayPath, done: 0, total: files.length, bytesTotal: Number(manifest.total_bytes) || 0, bytesDone: 0, errors: 0, startAt: Date.now() };
+  refreshTray();
+  try { new Notification({ title: 'Abel Drive', body: 'Baixando ' + displayPath + '…', silent: true }).show(); } catch (_) {}
+  let idx = 0;
+  const worker = async () => {
+    while (true) {
+      const i = idx++; if (i >= files.length) break;
+      const f = files[i];
+      const dest = path.join(localDir, ...String(f.rel).split('/'));
+      try {
+        const st = await fs.promises.stat(dest);
+        if (f.size != null && st.size === Number(f.size)) { syncProgress.done++; syncProgress.bytesDone += Number(f.size) || 0; continue; }
+        // SEGURANÇA (base da Fase 3): NÃO sobrescrever uma edição LOCAL sua. Se o
+        // arquivo local foi modificado depois da última sincronização, é trabalho
+        // seu — pula (o envio ao servidor / conflito é tratado na Fase 3). Nunca
+        // clobbera o que você editou.
+        if (protectAfterMs && st.mtimeMs > protectAfterMs) { syncProgress.done++; pinLog('sync protegeu edição local: ' + f.rel); continue; }
+      } catch (_) {}
+      const r = await downloadBlob(f.blob_key, dest, f.size);
+      if (r.ok) syncProgress.bytesDone += Number(f.size) || 0;
+      else { syncProgress.errors++; pinLog('sync erro ' + f.rel + ': ' + r.error); }
+      syncProgress.done++;
+      if (tray) { try { tray.setToolTip('Abel Drive — ' + syncProgressLine()); } catch (_) {} }
+      if (syncProgress.done % 20 === 0) refreshTray();
+    }
+  };
+  await Promise.all(Array.from({ length: SYNC_CONC }, () => worker()));
+
+  // Prune SEGURO: apaga só o que SUMIU DO SERVIDOR — arquivos que estavam na
+  // baseline anterior (sidecar) e não estão mais no manifesto. NUNCA toca em
+  // arquivos que existem só localmente (cópias de conflito, arquivos novos seus),
+  // nem em algo que você editou depois da última sync. Só roda se a lista veio
+  // não-vazia e o download não teve erro.
+  if (prune && files.length > 0 && syncProgress.errors === 0) {
+    const prev = await loadSidecar(localDir);
+    if (prev && prev.files) {
+      const nowSet = new Set(files.map((f) => String(f.rel)));
+      for (const rel of Object.keys(prev.files)) {
+        if (nowSet.has(rel)) continue;
+        const full = path.join(localDir, ...rel.split('/'));
+        try { const st = await fs.promises.stat(full); if (protectAfterMs && st.mtimeMs > protectAfterMs) continue; } catch (_) {}
+        try { await fs.promises.unlink(full); pinLog('sync removeu (sumiu do servidor): ' + full); } catch (_) {}
+      }
+    }
+  }
+
+  const errs = syncProgress.errors;
+  const syncedAt = Date.now();
+  const colName = manifest.collection || displayPath.split('/')[0];
+  const basePhys = manifest.base_phys || '';
+  // baseline por arquivo (tamanho + mtime local + "serverAt" = quando o servidor
+  // tinha aquela versão). É o que sustenta a detecção de edição e conflito.
+  try {
+    const sc = { syncedAt, collection: colName, base_phys: basePhys, files: {} };
+    for (const f of files) {
+      try { const st = await fs.promises.stat(path.join(localDir, ...String(f.rel).split('/'))); sc.files[f.rel] = { size: st.size, mtime: st.mtimeMs, serverAt: f.updated_at || null }; } catch (_) {}
+    }
+    await saveSidecar(localDir, sc);
+  } catch (e) { pinLog('sync sidecar falhou: ' + (e && e.message)); }
+  const arr = (readStore().synced || []).filter((s) => s.path.toLowerCase() !== displayPath.toLowerCase());
+  arr.push({ path: displayPath, localDir, at: new Date().toISOString(), syncedAt, collection: colName, base_phys: basePhys, fileCount: files.length, bytesTotal: Number(manifest.total_bytes) || 0, changesSince: new Date(Date.now() - 60000).toISOString() });
+  writeStore({ synced: arr });
+  syncProgress = null; syncBusy = false;
+  refreshTray();
+  try { new Notification({ title: 'Abel Drive', body: errs ? ('Baixado com ' + errs + ' aviso(s): ' + displayPath) : ('Pronto no computador: ' + displayPath), silent: true }).show(); } catch (_) {}
+  return { ok: true, errors: errs, localDir };
+}
+
+// Fluxo "Deixar um livro no computador" (bandeja): escolher pasta no drive →
+// medir → checar disco → confirmar → baixar.
+async function syncAddFlow() {
+  const mp = mountState.mountPoint;
+  if (!mp || mountState.status !== 'mounted') { dialog.showMessageBox({ type: 'info', message: 'Conecte o drive primeiro pra escolher um livro.' }); return; }
+  if (syncBusy) { dialog.showMessageBox({ type: 'info', message: 'Já estou baixando um livro. Espere terminar.' }); return; }
+  const r = await dialog.showOpenDialog({ title: 'Escolha um livro/pasta do Abel Drive para deixar no computador', defaultPath: mp, properties: ['openDirectory'] });
+  if (r.canceled || !r.filePaths || !r.filePaths[0]) return;
+  const rel = relToMount(r.filePaths[0], mp);
+  if (rel == null) { dialog.showMessageBox({ type: 'warning', message: 'Escolha uma pasta de dentro do Abel Drive (' + mp + ').' }); return; }
+  if (!rel) { dialog.showMessageBox({ type: 'warning', message: 'Escolha uma subpasta (um livro), não a raiz do drive.' }); return; }
+  const displayPath = rel.replace(/\\/g, '/');
+  const m = await syncMeasure(displayPath);
+  if (!m.ok) { dialog.showMessageBox({ type: 'error', message: 'Não consegui medir este livro.', detail: displayPath + '\n(' + m.error + ')' }); return; }
+  const free = freeBytesAt(syncRootDir());
+  const detail = displayPath + '\n\n' + m.file_count + ' arquivos · ' + humanBytes(m.total_bytes) + (free != null ? ('\nEspaço livre no disco: ' + humanBytes(free)) : '');
+  if (free != null && free < m.total_bytes * 1.1) { dialog.showMessageBox({ type: 'warning', message: 'Espaço insuficiente pra baixar este livro.', detail }); return; }
+  const c = await dialog.showMessageBox({ type: 'question', buttons: ['Baixar', 'Cancelar'], defaultId: 0, cancelId: 1, message: 'Deixar este livro no computador?', detail });
+  if (c.response !== 0) return;
+  syncDownload(displayPath, m).catch((e) => pinLog('sync falhou: ' + (e && e.message)));
+}
+
+// "Liberar espaço": apaga a cópia local (o servidor continua com tudo).
+async function syncRemoveFlow(entry) {
+  const c = await dialog.showMessageBox({ type: 'question', buttons: ['Liberar espaço', 'Cancelar'], defaultId: 1, cancelId: 1, message: 'Apagar a cópia local deste livro?', detail: entry.path + '\n\nSó apaga do seu computador — o servidor continua com tudo.' });
+  if (c.response !== 0) return;
+  try { await fs.promises.rm(entry.localDir, { recursive: true, force: true }); } catch (_) {}
+  const arr = (readStore().synced || []).filter((s) => s.path.toLowerCase() !== entry.path.toLowerCase());
+  writeStore({ synced: arr });
+  refreshTray();
+  try { new Notification({ title: 'Abel Drive', body: 'Espaço liberado: ' + entry.path, silent: true }).show(); } catch (_) {}
+}
+
+// ══════════════════════════════════════════════════════════════════════
+// ESCRITA (Fase 3): suas edições SOBEM. Envio automático ligado por padrão.
+// Sobe pelo caminho BLINDADO do gateway (trava 423 + snapshot de versão +
+// conferência md5). Conflito = pergunta (opção 4) + guarda o lado não
+// escolhido. Nunca perde trabalho — nem seu, nem do colega.
+// ══════════════════════════════════════════════════════════════════════
+
+function webdavAuthHeader() {
+  const secret = readStore().cred_secret;
+  if (!secret) return null;
+  return 'Basic ' + Buffer.from('abel-drive:' + secret).toString('base64');
+}
+function webdavUrlFor(colName, within) {
+  return WEBDAV_URL + '/' + encodeURIComponent(colName) + '/' + String(within).split('/').map(encodeURIComponent).join('/');
+}
+
+// Sobe um arquivo local pelo gateway (reusa a credencial WebDAV do mount).
+async function uploadFileToServer(colName, within, filePath) {
+  const auth = webdavAuthHeader();
+  if (!auth) return { ok: false, error: 'NO_CRED' };
+  let body;
+  try { body = await fs.promises.readFile(filePath); } catch (_) { return { ok: false, error: 'READ' }; }
+  let res;
+  try {
+    res = await fetch(webdavUrlFor(colName, within), {
+      method: 'PUT',
+      headers: { 'Authorization': auth, 'Content-Type': 'application/octet-stream', 'Content-Length': String(body.length) },
+      body,
+    });
+  } catch (_) { return { ok: false, error: 'NETWORK' }; }
+  if (res.status === 423) return { ok: false, error: 'LOCKED' };
+  if (!res.ok) return { ok: false, error: 'HTTP_' + res.status };
+  return { ok: true };
+}
+
+// Baixa a versão ATUAL do servidor (segue o 302 do WebDAV GET) pra um destino.
+async function downloadServerVersion(colName, within, destPath) {
+  const auth = webdavAuthHeader();
+  if (!auth) return { ok: false, error: 'NO_CRED' };
+  let res;
+  try { res = await fetch(webdavUrlFor(colName, within), { headers: { 'Authorization': auth } }); }
+  catch (_) { return { ok: false, error: 'NETWORK' }; }
+  if (!res.ok || !res.body) return { ok: false, error: 'HTTP_' + res.status };
+  try { await fs.promises.mkdir(path.dirname(destPath), { recursive: true }); } catch (_) {}
+  try {
+    const { Readable } = require('stream');
+    await new Promise((resolve, reject) => { const out = fs.createWriteStream(destPath); Readable.fromWeb(res.body).pipe(out); out.on('finish', resolve); out.on('error', reject); });
+    return { ok: true };
+  } catch (_) { return { ok: false, error: 'WRITE' }; }
+}
+
+function syncFileInfo(colName, within) {
+  return apiGet('/vfs/fileinfo?path=' + encodeURIComponent(colName + '/' + within));
+}
+
+// Detecta edições (por TAMANHO — evita disparo à toa por mtime) e arquivos novos.
+async function syncScanEdits(localDir, sidecar) {
+  const edited = [], created = [];
+  const known = sidecar.files || {};
+  for (const rel of Object.keys(known)) {
+    try { const st = await fs.promises.stat(path.join(localDir, ...rel.split('/'))); if (st.size !== Number(known[rel].size)) edited.push(rel); } catch (_) {}
+  }
+  const knownSet = new Set(Object.keys(known).map((r) => path.join(localDir, ...r.split('/'))));
+  const walk = async (dir, relBase) => {
+    let ents; try { ents = await fs.promises.readdir(dir, { withFileTypes: true }); } catch (_) { return; }
+    for (const e of ents) {
+      if (e.name === '.abel-sync.json' || e.name.endsWith('.part')) continue;
+      if (/\((conflito|minha edição|servidor)/i.test(e.name)) continue;   // cópias de conflito não sobem
+      const full = path.join(dir, e.name);
+      const rel = relBase ? relBase + '/' + e.name : e.name;
+      if (e.isDirectory()) await walk(full, rel);
+      else if (!knownSet.has(full)) created.push(rel);
+    }
+  };
+  await walk(localDir, '');
+  return { edited, created };
+}
+
+function conflictCopyName(filePath, tag) {
+  const ext = path.extname(filePath);
+  return filePath.slice(0, filePath.length - ext.length) + ' (' + tag + ')' + ext;
+}
+
+// Conflito (opção 4): pergunta com nome/horário, guarda o lado não escolhido.
+async function syncHandleConflict(entry, sidecar, colName, rel, within, info) {
+  const full = path.join(entry.localDir, ...rel.split('/'));
+  const who = (info && info.updated_by_name) ? info.updated_by_name : 'outra pessoa';
+  const when = info && info.updated_at ? new Date(info.updated_at).toLocaleString('pt-BR') : '';
+  const r = await dialog.showMessageBox({
+    type: 'warning',
+    buttons: ['Ficar com a MINHA', 'Ficar com a do SERVIDOR', 'Decidir depois'],
+    defaultId: 2, cancelId: 2,
+    message: 'Conflito em ' + rel,
+    detail: 'Você editou este arquivo, mas ' + who + ' subiu uma versão' + (when ? ' às ' + when : '') + '.\n\nO lado que você NÃO escolher fica guardado como cópia — nada se perde.',
+  });
+  if (r.response === 2) { pinLog('sync conflito adiado: ' + rel); return; }
+  if (r.response === 0) {
+    // MINHA vence: guarda a do servidor do lado, depois sobe a minha.
+    await downloadServerVersion(colName, within, conflictCopyName(full, 'servidor de ' + who));
+    const up = await uploadFileToServer(colName, within, full);
+    if (up.ok) {
+      const inf2 = await syncFileInfo(colName, within);
+      let st; try { st = await fs.promises.stat(full); } catch (_) {}
+      sidecar.files[rel] = { size: st ? st.size : (sidecar.files[rel] && sidecar.files[rel].size) || 0, mtime: st ? st.mtimeMs : Date.now(), serverAt: (inf2 && inf2.updated_at) || new Date().toISOString() };
+      await saveSidecar(entry.localDir, sidecar);
+      try { new Notification({ title: 'Abel Drive', body: 'Conflito resolvido (sua versão subiu): ' + rel, silent: true }).show(); } catch (_) {}
+    } else { try { new Notification({ title: 'Abel Drive', body: 'Não consegui subir sua versão (' + up.error + '): ' + rel, silent: true }).show(); } catch (_) {} }
+  } else {
+    // SERVIDOR vence: guarda a minha do lado, depois baixo a do servidor por cima.
+    try { await fs.promises.copyFile(full, conflictCopyName(full, 'minha edição')); } catch (_) {}
+    const dl = await downloadServerVersion(colName, within, full);
+    if (dl.ok) {
+      const inf2 = await syncFileInfo(colName, within);
+      let st; try { st = await fs.promises.stat(full); } catch (_) {}
+      sidecar.files[rel] = { size: st ? st.size : 0, mtime: st ? st.mtimeMs : Date.now(), serverAt: (inf2 && inf2.updated_at) || new Date().toISOString() };
+      await saveSidecar(entry.localDir, sidecar);
+      try { new Notification({ title: 'Abel Drive', body: 'Conflito resolvido (versão do servidor): ' + rel, silent: true }).show(); } catch (_) {}
+    }
+  }
+}
+
+// Sobe suas edições locais de um livro. Ligado por padrão (readStore().syncUpload
+// só desliga se for explicitamente false).
+async function syncPushEdits(entry) {
+  if (readStore().syncUpload === false) return;
+  const localDir = entry.localDir;
+  const sidecar = await loadSidecar(localDir);
+  if (!sidecar) return;
+  const colName = sidecar.collection || entry.collection || entry.path.split('/')[0];
+  const base = sidecar.base_phys != null ? sidecar.base_phys : (entry.base_phys || '');
+  const { edited, created } = await syncScanEdits(localDir, sidecar);
+  const items = [...edited.map((r) => ({ rel: r })), ...created.map((r) => ({ rel: r }))];
+  for (const it of items) {
+    const rel = it.rel;
+    const within = (base ? base + '/' : '') + rel;
+    const full = path.join(localDir, ...rel.split('/'));
+    let st; try { st = await fs.promises.stat(full); } catch (_) { continue; }
+    const info = await syncFileInfo(colName, within);
+    const baseServerAt = sidecar.files[rel] && sidecar.files[rel].serverAt ? Date.parse(sidecar.files[rel].serverAt) : 0;
+    const serverChanged = info && info.ok && info.exists && info.updated_at && Date.parse(info.updated_at) > baseServerAt;
+    if (serverChanged) { await syncHandleConflict(entry, sidecar, colName, rel, within, info); continue; }
+    const up = await uploadFileToServer(colName, within, full);
+    if (up.ok) {
+      const inf2 = await syncFileInfo(colName, within);
+      sidecar.files[rel] = { size: st.size, mtime: st.mtimeMs, serverAt: (inf2 && inf2.updated_at) || new Date().toISOString() };
+      await saveSidecar(localDir, sidecar);
+      pinLog('sync enviou: ' + rel);
+    } else if (up.error === 'LOCKED') {
+      try { new Notification({ title: 'Abel Drive', body: 'Arquivo aberto por outra pessoa — não enviei: ' + rel, silent: true }).show(); } catch (_) {}
+    } else { pinLog('sync envio falhou ' + rel + ': ' + up.error); }
+  }
+}
+
+// Atualizador: mantém os livros baixados em dia (usa o /changes; re-baixa só o
+// que mudou e apaga o que sumiu). Um por vez, sem atrapalhar um download manual.
+async function syncUpdaterTick() {
+  if (syncBusy) return;
+  const list = readStore().synced || [];
+  for (const entry of list) {
+    if (syncBusy) break;
+    try {
+      await syncPushEdits(entry);   // 1º: sobe SUAS edições locais (conferido + versão)
+      const since = entry.changesSince || new Date(Date.now() - 60000).toISOString();
+      const ch = await apiGet('/vfs/changes?since=' + encodeURIComponent(since));
+      if (!ch || ch.ok !== true) continue;
+      const nextSince = ch.now ? new Date(Date.parse(ch.now) - 30000).toISOString() : since;
+      const dirs = Array.isArray(ch.dirs) ? ch.dirs : [];
+      const p = entry.path.toLowerCase();
+      const touched = dirs.some((d) => { const dl = String(d).toLowerCase(); return dl === p || dl.startsWith(p + '/'); });
+      const store = readStore(); const arr = store.synced || []; const cur = arr.find((s) => s.path === entry.path);
+      if (cur) { cur.changesSince = nextSince; writeStore({ synced: arr }); }
+      if (!touched) continue;
+      const m = await syncMeasure(entry.path);
+      if (!m.ok) continue;
+      await syncDownload(entry.path, m, { prune: true, protectAfterMs: entry.syncedAt || 0 });
+    } catch (e) { pinLog('sync updater erro: ' + (e && e.message)); }
+  }
+}
+
+function startSyncUpdater() {
+  if (syncUpdTimer) return;
+  syncUpdTimer = setInterval(() => { syncUpdaterTick().catch(() => {}); }, 90000);
+  setTimeout(() => { syncUpdaterTick().catch(() => {}); }, 15000);
+}
+
+// Itens de bandeja dos livros baixados.
+function buildSyncedItems() {
+  const list = readStore().synced || [];
+  if (!list.length) return [{ label: '(nenhum livro baixado ainda)', enabled: false }];
+  return list.map((e) => ({
+    label: e.path + '  (' + humanBytes(e.bytesTotal) + ')',
+    submenu: [
+      { label: 'Abrir a pasta', click: () => shell.openPath(e.localDir) },
+      { label: 'Liberar espaço…', click: () => syncRemoveFlow(e) },
+    ],
+  }));
+}
+
+ipcMain.handle('sync:list', () => ({ synced: readStore().synced || [], progress: syncProgress }));
+ipcMain.handle('sync:add', () => syncAddFlow());
+
+// ══════════════════════════════════════════════════════════════════════
 // BANDEJA (system tray) + auto-conectar + iniciar com o Windows
 // ══════════════════════════════════════════════════════════════════════
 
@@ -922,6 +1333,11 @@ function buildTrayMenu() {
     mounted
       ? { label: 'Desconectar', click: () => driveDisconnect() }
       : { label: busy ? (st === 'reconnecting' ? 'Reconectando…' : 'Conectando…') : 'Conectar meu drive', enabled: !busy, click: () => driveConnect() },
+    { type: 'separator' },
+    ...(syncProgress ? [{ label: 'Baixando ' + syncProgressLine(), enabled: false }] : []),
+    { label: 'Deixar um livro no computador…', enabled: mounted && !syncBusy, click: () => syncAddFlow() },
+    { label: 'Livros no computador', submenu: buildSyncedItems() },
+    { label: 'Enviar minhas edições automaticamente', type: 'checkbox', checked: readStore().syncUpload !== false, click: (item) => writeStore({ syncUpload: item.checked }) },
     { type: 'separator' },
     { label: 'Iniciar com o Windows', type: 'checkbox', checked: openAtLogin,
       click: (item) => app.setLoginItemSettings({ openAtLogin: item.checked }) },
@@ -1040,6 +1456,7 @@ app.whenReady().then(() => {
   createWindow();
   createTray();
   initAutoUpdate();
+  startSyncUpdater();   // mantém os livros "deixados no computador" em dia
 
   // Notebook acordou: se estávamos reconectando (ou já caímos pra erro por
   // rede), tenta AGORA em vez de esperar o backoff. Não quebra se powerMonitor
