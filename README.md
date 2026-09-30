@@ -28,12 +28,25 @@ npm start
 Deve abrir uma janela "Abel Drive" com a tela de login. Fluxo:
 
 1. Digita seu e-mail → **Continuar**.
-2. Se você tem acesso a mais de uma empresa, escolhe uma.
-3. Chega um **código por e-mail** — digita na tela.
-4. Se você tiver 2FA, o campo do autenticador aparece.
-5. Conectado. (O próximo passo, montar o drive, ainda está em construção.)
+2. Chega um **código por e-mail** — digita na tela.
+3. Se você tiver 2FA, o campo do autenticador aparece.
+4. Se você tem acesso a mais de uma empresa, escolhe uma (só depois do código).
+5. Conectado.
 
 A sessão fica guardada, então da próxima vez abre já conectado (use **Sair** para trocar).
+
+Por dentro (desde 30/09/2026): `request-pin` sem empresa → `verify-pin` com
+`empresa_depois: true`, `client_type: "drive"` e o `device_id` da instalação.
+Com várias empresas a resposta traz `escolher_empresa` + `companies`, e o Drive
+chama o `verify-pin` de novo com `company_id` e o mesmo código/2FA. O
+`/auth/identify` não é mais usado. Regras em `src/renderer/login-flow.js`.
+
+## Testes
+
+```
+npm test     # fluxo do login: uma empresa, várias, 2FA, plataforma nova e antiga
+npm run lint # checagem de sintaxe de todos os .js
+```
 
 ## Notas
 

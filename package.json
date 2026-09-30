@@ -8,6 +8,8 @@
   "main": "src/main.js",
   "scripts": {
     "start": "electron .",
+    "test": "node --test \"test/*.test.js\"",
+    "lint": "node --check src/main.js && node --check src/preload.js && node --check src/renderer/app.js && node --check src/renderer/login-flow.js && node --check test/login-flow.test.js",
     "dist": "electron-builder --win",
     "dist:mac": "electron-builder --mac --universal"
   },

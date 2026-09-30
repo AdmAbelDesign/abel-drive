@@ -1,12 +1,15 @@
 'use strict';
 
 // Abel Drive — lógica do renderer (só UI; a rede vive no processo principal).
-// Fluxo: e-mail → (escolher empresa) → PIN (+ 2FA) → conectado.
+// Fluxo (desde 30/09/2026): e-mail → código (+ 2FA) → (escolher empresa) → conectado.
+// A plataforma só mostra as empresas DEPOIS do código. Regras em login-flow.js.
 
 const $ = (id) => document.getElementById(id);
 const screens = ['screen-email', 'screen-company', 'screen-pin', 'screen-done'];
 
-const state = { email: '', companies: [], companyId: null, user: null, company: null };
+// pin/totp ficam guardados entre a 1a chamada do verify-pin e a escolha da
+// empresa: a 2a chamada precisa do MESMO código (ele não é consumido).
+const state = { email: '', companies: [], user: null, pin: '', totp: '' };
 
 function show(screenId) {
   screens.forEach((s) => $(s).classList.toggle('hidden', s !== screenId));
@@ -24,17 +27,18 @@ function busy(btn, on) { btn.classList.toggle('spin', on); btn.disabled = on; }
 // Mensagens amigáveis para os códigos de erro conhecidos da API.
 function friendly(err) {
   const map = {
-    USER_NOT_FOUND: 'E-mail não encontrado. Confira e tente de novo.',
     NETWORK: 'Sem conexão com o Ecossistema. Verifique sua internet.',
     TOO_MANY_ATTEMPTS: 'Muitas tentativas. Aguarde alguns minutos.',
     PIN_INVALID: 'Código incorreto. Confira e tente de novo.',
-    PIN_EXPIRED: 'O código expirou. Peça um novo.',
+    PIN_EXPIRED: 'Código vencido ou inválido. Peça um novo (Reenviar código).',
     PIN_NOT_REQUESTED: 'Peça um código primeiro (Reenviar código).',
     ACCOUNT_LOCKED: 'Conta bloqueada por tentativas. Aguarde 30 min.',
     TOTP_REQUIRED: 'Digite também o código do seu autenticador (2FA).',
     TOTP_INVALID: 'Código do autenticador incorreto.',
     COMPANY_BLOCKED: 'O acesso desta empresa está bloqueado.',
     COMPANY_SUSPENDED: 'A assinatura desta empresa está suspensa.',
+    SEM_EMPRESA_ATIVA: 'Nenhuma empresa ativa disponível para esta conta.',
+    ENDERECO_NAO_CONFERE: 'Esta conta não pertence a este endereço.',
     SESSION_INVALID: 'Sessão inválida. Faça login de novo.',
     INTERNAL_ERROR: 'Erro no servidor. Tente de novo em instantes.',
   };
@@ -42,30 +46,45 @@ function friendly(err) {
   return map[err] || ('Não consegui entrar (' + (err || 'desconhecido') + ').');
 }
 
-// ── Tela 1: e-mail → identify ──────────────────────────────────────────
-async function doIdentify() {
+// ── Tela 1: e-mail → request-pin ───────────────────────────────────────
+async function doEmail() {
   const email = $('email').value.trim().toLowerCase();
   if (!email || !email.includes('@')) return msg('Digite um e-mail válido.');
   state.email = email;
+  state.companies = []; state.user = null; state.pin = ''; state.totp = '';
+  $('totp').value = '';
+  $('totp-wrap').classList.add('hidden');
   busy($('btn-email'), true);
-  const r = await window.abel.identify(email);
+  await requestPin();
   busy($('btn-email'), false);
-
-  if (!r.ok) return msg(friendly(r.error));
-  state.companies = r.companies || [];
-  state.user = r.user || null;
-
-  if (state.companies.length === 0) return msg('Nenhuma empresa vinculada a este e-mail.');
-  if (state.companies.length === 1) {
-    state.companyId = state.companies[0].id;
-    state.company = state.companies[0];
-    return requestPin();
-  }
-  renderCompanies();
-  show('screen-company');
 }
 
-// ── Tela 2: escolher empresa ───────────────────────────────────────────
+// ── request-pin → Tela do código ───────────────────────────────────────
+// A resposta é a mesma exista ou não a conta ("se tiver conta, o código chega").
+async function requestPin() {
+  msg('Enviando o código para o seu e-mail…', 'info');
+  const r = await window.abel.requestPin(state.email);
+  if (!r.ok) return msg(friendly(r.error));
+  $('pin-email').textContent = state.email;
+  $('pin').value = '';
+  show('screen-pin');
+  msg('Se este e-mail tiver conta no Ecossistema, o código chega em instantes.', 'info');
+  $('pin').focus();
+}
+
+// ── verify-pin (1a chamada, sem empresa) ───────────────────────────────
+async function doVerify() {
+  const pin = $('pin').value.trim();
+  const totp = $('totp').value.trim();
+  if (!pin) return msg('Digite o código que enviamos por e-mail.');
+  state.pin = pin; state.totp = totp;
+  busy($('btn-pin'), true);
+  const r = await window.abel.verifyPin(state.email, pin, totp || null, null);
+  busy($('btn-pin'), false);
+  await handleVerify(r, null);
+}
+
+// ── Tela da empresa (só depois do código, quando há mais de uma) ───────
 function renderCompanies() {
   const list = $('company-list');
   list.innerHTML = '';
@@ -75,42 +94,51 @@ function renderCompanies() {
     b.innerHTML = `<span class="dot"></span><span>
       <span class="cname">${escapeHtml(c.name)}</span><br>
       <span class="crole">${escapeHtml(c.role || '')}</span></span>`;
-    b.onclick = () => { state.companyId = c.id; state.company = c; requestPin(); };
+    b.onclick = () => chooseCompany(c, b);
     list.appendChild(b);
   });
 }
 
-// ── request-pin → Tela 3 ───────────────────────────────────────────────
-async function requestPin() {
-  msg('Enviando o código para o seu e-mail…', 'info');
-  const r = await window.abel.requestPin(state.email, state.companyId);
-  if (!r.ok) return msg(friendly(r.error));
-  $('pin-email').textContent = state.email;
-  $('pin').value = '';
-  show('screen-pin');
-  $('pin').focus();
+// verify-pin (2a chamada): a empresa escolhida + o MESMO código e 2FA.
+async function chooseCompany(c, btn) {
+  const all = document.querySelectorAll('#company-list .company');
+  all.forEach((x) => { x.disabled = true; });
+  busy(btn, true);
+  const r = await window.abel.verifyPin(state.email, state.pin, state.totp || null, c.id);
+  busy(btn, false);
+  all.forEach((x) => { x.disabled = false; });
+  await handleVerify(r, c);
 }
 
-// ── verify-pin → Tela 4 ────────────────────────────────────────────────
-async function doVerify() {
-  const pin = $('pin').value.trim();
-  const totp = $('totp').value.trim();
-  if (!pin) return msg('Digite o código que enviamos por e-mail.');
-  busy($('btn-pin'), true);
-  const r = await window.abel.verifyPin(state.email, pin, totp || null);
-  busy($('btn-pin'), false);
+async function handleVerify(r, chosen) {
+  const res = window.AbelLogin.lerRespostaDoVerify(r);
 
-  if (!r.ok) {
-    // 2FA: revela o campo do autenticador quando o backend pede.
-    if (r.error === 'TOTP_REQUIRED') $('totp-wrap').classList.remove('hidden');
-    return msg(friendly(r.error));
+  if (res.passo === 'escolher') {
+    state.companies = res.companies;
+    state.user = res.user;
+    renderCompanies();
+    show('screen-company');
+    return;
   }
 
-  // Guarda um retrato leve para a tela e para sessões futuras.
+  if (res.passo === 'erro') {
+    if (res.pedir2fa) $('totp-wrap').classList.remove('hidden');
+    // Erro do código/2FA volta para a tela do código; erro da empresa
+    // escolhida (bloqueada, suspensa) fica na lista para escolher outra.
+    if (res.voltarAoCodigo || !chosen) {
+      show('screen-pin');
+      if (res.pedir2fa) $('totp').focus();
+    }
+    return msg(friendly(res.error));
+  }
+
+  // Entrou. Nome da pessoa e da empresa para a tela "conectado".
+  const who = await window.abel.whoami();
   const profile = {
-    name: (state.user && state.user.display_name) || state.email,
-    company: (state.company && state.company.name) || '',
+    name: (who && who.ok && who.name) || (state.user && state.user.display_name) || state.email,
+    company: (who && who.ok && who.company) || (chosen && chosen.name) || '',
   };
+  state.pin = ''; state.totp = '';
   await window.abel.setProfile(profile);
   $('done-name').textContent = 'Conectado como ' + profile.name;
   $('done-company').textContent = profile.company;
@@ -121,7 +149,7 @@ async function doVerify() {
 // ── logout ─────────────────────────────────────────────────────────────
 async function doLogout() {
   await window.abel.logout();
-  state.companyId = null; state.company = null;
+  state.companies = []; state.user = null; state.pin = ''; state.totp = '';
   $('email').value = '';
   show('screen-email');
   $('email').focus();
@@ -386,10 +414,10 @@ function escapeHtml(s) {
 
 // ── ligações ───────────────────────────────────────────────────────────
 window.addEventListener('DOMContentLoaded', async () => {
-  $('btn-email').onclick = doIdentify;
-  $('email').addEventListener('keydown', (e) => { if (e.key === 'Enter') doIdentify(); });
+  $('btn-email').onclick = doEmail;
+  $('email').addEventListener('keydown', (e) => { if (e.key === 'Enter') doEmail(); });
 
-  $('btn-company-back').onclick = () => show('screen-email');
+  $('btn-company-back').onclick = () => show('screen-pin');
 
   $('btn-pin').onclick = doVerify;
   $('pin').addEventListener('keydown', (e) => { if (e.key === 'Enter') doVerify(); });

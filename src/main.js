@@ -8,8 +8,9 @@
 // O renderer NUNCA fala direto com a rede — tudo passa por aqui, para manter
 // o segredo/sessão fora da camada de UI.
 //
-// M6a (esqueleto): só o fluxo de LOGIN (identify → request-pin → verify-pin).
-// O mount do rclone entra no M6a-2.
+// Login (desde 30/09/2026): e-mail → request-pin → verify-pin com
+// empresa_depois; a escolha da empresa vem DEPOIS do código. Regras em
+// renderer/login-flow.js.
 // ══════════════════════════════════════════════════════════════════════
 
 const { app, BrowserWindow, ipcMain, shell, Tray, Menu, nativeImage, dialog, powerMonitor, Notification } = require('electron');
@@ -19,6 +20,7 @@ const crypto = require('crypto');
 const { spawn, execFile } = require('child_process');
 const os = require('os');
 const net = require('net');
+const AbelLogin = require('./renderer/login-flow');
 
 // Base da API do Ecossistema (backend no Fly.io / São Paulo, via domínio próprio).
 const API_BASE = 'https://api.ecossistemaabel.com.br/api';
@@ -79,9 +81,11 @@ function writeStore(patch) {
 }
 
 // device_id estável por instalação (o backend usa para reconhecer o aparelho).
+// Não muda a cada login: o teto "1 aparelho de cada tipo" usa este id para
+// renovar a vaga do mesmo aparelho. Só é refeito se o guardado for inválido.
 function getDeviceId() {
   const s = readStore();
-  if (s.device_id) return s.device_id;
+  if (AbelLogin.deviceIdValido(s.device_id)) return s.device_id;
   const id = crypto.randomUUID();
   writeStore({ device_id: id });
   return id;
@@ -118,24 +122,35 @@ ipcMain.handle('app:getState', () => {
 
 ipcMain.handle('app:version', () => app.getVersion());
 
-ipcMain.handle('auth:identify', async (_e, email) => {
-  return api('/auth/identify', { body: { email } });
+// O /auth/identify não é mais usado: desde 30/09 ele não revela nada.
+ipcMain.handle('auth:requestPin', async (_e, { email }) => {
+  return api('/auth/request-pin', { body: AbelLogin.corpoDoRequestPin({ email }) });
 });
 
-ipcMain.handle('auth:requestPin', async (_e, { email, companyId }) => {
-  return api('/auth/request-pin', { body: { email, company_id: companyId } });
-});
-
-ipcMain.handle('auth:verifyPin', async (_e, { email, pin, totp }) => {
-  // O schema do backend aceita `totp` só como texto ou AUSENTE — nunca null.
-  // Sem 2FA, o campo é omitido (JSON.stringify descarta `undefined`).
-  const body = { email, pin, device_id: getDeviceId() };
-  if (totp) body.totp = totp;
+// verify-pin com empresa_depois. Com várias empresas a 1a chamada volta
+// { escolher_empresa, companies } sem sessão; a tela chama de novo com
+// companyId e o MESMO código (e 2FA).
+ipcMain.handle('auth:verifyPin', async (_e, { email, pin, totp, companyId }) => {
+  const body = AbelLogin.corpoDoVerifyPin({ email, pin, totp, companyId, deviceId: getDeviceId() });
   const out = await api('/auth/verify-pin', { body });
   if (out.ok && out.session_id) {
     writeStore({ session_id: out.session_id });
   }
   return out;
+});
+
+// Quem entrou e em qual empresa (nome para a tela "conectado"). O verify-pin
+// devolve só ids; o validate-session tem os nomes.
+ipcMain.handle('auth:whoami', async () => {
+  const s = readStore();
+  if (!s.session_id) return { ok: false, error: 'SESSION_INVALID' };
+  const r = await api('/auth/validate-session', { body: { session_id: s.session_id } });
+  if (!r || !r.valid) return { ok: false, error: (r && r.error) || 'SESSION_INVALID' };
+  return {
+    ok: true,
+    name: (r.user && r.user.display_name) || '',
+    company: (r.company && r.company.name) || '',
+  };
 });
 
 // Guarda um retrato leve do usuário/empresa para a tela "conectado".

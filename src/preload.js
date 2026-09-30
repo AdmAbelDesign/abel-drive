@@ -8,9 +8,9 @@ const { contextBridge, ipcRenderer } = require('electron');
 contextBridge.exposeInMainWorld('abel', {
   getState:    ()               => ipcRenderer.invoke('app:getState'),
   version:     ()               => ipcRenderer.invoke('app:version'),
-  identify:    (email)          => ipcRenderer.invoke('auth:identify', email),
-  requestPin:  (email, companyId) => ipcRenderer.invoke('auth:requestPin', { email, companyId }),
-  verifyPin:   (email, pin, totp) => ipcRenderer.invoke('auth:verifyPin', { email, pin, totp }),
+  requestPin:  (email)          => ipcRenderer.invoke('auth:requestPin', { email }),
+  verifyPin:   (email, pin, totp, companyId) => ipcRenderer.invoke('auth:verifyPin', { email, pin, totp, companyId }),
+  whoami:      ()               => ipcRenderer.invoke('auth:whoami'),
   setProfile:  (profile)        => ipcRenderer.invoke('auth:setProfile', profile),
   logout:      ()               => ipcRenderer.invoke('auth:logout'),
 
