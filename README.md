@@ -50,7 +50,7 @@ npm run lint # checagem de sintaxe de todos os .js
 
 ## Notas
 
-- A API usada é a de produção (`ecossistema-abel-production.up.railway.app`).
+- A API usada é a de produção (`api.ecossistemaabel.com.br`, servidor no Fly; o Railway foi encerrado em 23/09/2026).
 - `device_id`, sessão e perfil ficam em `%APPDATA%/abel-drive/abel-drive.json`.
 - Nada de senha é guardado — o login é por código de uso único.
 
