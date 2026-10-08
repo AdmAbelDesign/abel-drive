@@ -1,6 +1,6 @@
 {
   "name": "abel-drive",
-  "version": "0.1.26",
+  "version": "0.1.27",
   "description": "Abel Drive — acesso aos arquivos do Ecossistema Abel como um drive no computador.",
   "author": "Abel Design",
   "license": "UNLICENSED",
@@ -9,7 +9,7 @@
   "scripts": {
     "start": "electron .",
     "test": "node --test \"test/*.test.js\"",
-    "lint": "node --check src/main.js && node --check src/preload.js && node --check src/renderer/app.js && node --check src/renderer/login-flow.js && node --check test/login-flow.test.js",
+    "lint": "node --check src/main.js && node --check src/preload.js && node --check src/renderer/app.js && node --check src/renderer/login-flow.js && node --check src/regras-do-drive.js && node --check test/login-flow.test.js && node --check test/regras-do-drive.test.js",
     "dist": "electron-builder --win",
     "dist:mac": "electron-builder --mac --universal"
   },

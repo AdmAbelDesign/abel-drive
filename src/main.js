@@ -11,6 +11,10 @@
 // Login (desde 30/09/2026): e-mail → request-pin → verify-pin com
 // empresa_depois; a escolha da empresa vem DEPOIS do código. Regras em
 // renderer/login-flow.js.
+//
+// 0.1.27 (08/10/2026): sincronização só para ADMIN/SUPER (experimental),
+// frase certa para cada recusa e lista de coleções atualizada a cada 5 min.
+// Regras em regras-do-drive.js.
 // ══════════════════════════════════════════════════════════════════════
 
 const { app, BrowserWindow, ipcMain, shell, Tray, Menu, nativeImage, dialog, powerMonitor, Notification } = require('electron');
@@ -21,6 +25,7 @@ const { spawn, execFile } = require('child_process');
 const os = require('os');
 const net = require('net');
 const AbelLogin = require('./renderer/login-flow');
+const Regras = require('./regras-do-drive');
 
 // Base da API do Ecossistema (backend no Fly.io / São Paulo, via domínio próprio).
 const API_BASE = 'https://api.ecossistemaabel.com.br/api';
@@ -146,12 +151,34 @@ ipcMain.handle('auth:whoami', async () => {
   if (!s.session_id) return { ok: false, error: 'SESSION_INVALID' };
   const r = await api('/auth/validate-session', { body: { session_id: s.session_id } });
   if (!r || !r.valid) return { ok: false, error: (r && r.error) || 'SESSION_INVALID' };
+  guardarPapel(r);
   return {
     ok: true,
     name: (r.user && r.user.display_name) || '',
     company: (r.company && r.company.name) || '',
   };
 });
+
+// Papel da pessoa na empresa da sessão (ADMIN, COORD, USER...). Decide quem vê
+// a sincronização. Vem do validate-session (user.role já traz SUPER).
+function guardarPapel(r) {
+  const papel = (r && r.user && r.user.role) || (r && r.company && r.company.role) || null;
+  if (papel && papel !== readStore().role) {
+    writeStore({ role: papel });
+    refreshTray();
+  }
+}
+
+// Confere a sessão antes de montar (e a cada 5 min com o drive montado).
+// Devolve o motivo lido (regras-do-drive) ou null quando está tudo certo.
+// Sessão vencida NÃO barra aqui: a credencial do drive pode seguir valendo.
+async function conferirSessao() {
+  const s = readStore();
+  if (!s.session_id) return null;
+  const r = await api('/auth/validate-session', { body: { session_id: s.session_id } });
+  if (r && r.valid) { guardarPapel(r); return null; }
+  return Regras.lerMotivo({ error: r && r.error, status: r && r._status, message: r && r.message });
+}
 
 // Guarda um retrato leve do usuário/empresa para a tela "conectado".
 ipcMain.handle('auth:setProfile', (_e, profile) => {
@@ -161,7 +188,7 @@ ipcMain.handle('auth:setProfile', (_e, profile) => {
 
 ipcMain.handle('auth:logout', async () => {
   try { await api('/auth/logout', { withSession: true }); } catch (_) {}
-  writeStore({ session_id: null, profile: null, cred_secret: null, cred_expires: null });
+  writeStore({ session_id: null, profile: null, cred_secret: null, cred_expires: null, role: null });
   return { ok: true };
 });
 
@@ -337,6 +364,24 @@ function stopChangesPoll() {
   if (changesTimer) { clearInterval(changesTimer); changesTimer = null; }
   changesBusy = false;
 }
+
+// ── Lista de coleções (raiz do drive) a cada 5 min — 0.1.27 ────────────
+// O /vfs/changes só avisa mudança de ARQUIVO; coleção excluída, arquivada,
+// com "não mostrar no Drive" ou de equipe da qual a pessoa saiu continuava na
+// raiz do drive montado (dir-cache de 1000 h) até desconectar. Agora a raiz
+// é relida do servidor a cada 5 min e ao voltar do sono. Barato: só a raiz,
+// sem recursão, e não mexe no cache dos arquivos já baixados.
+// Na mesma volta, confere a sessão: papel atualizado (quem vê a
+// sincronização) e, se a pessoa perdeu o acesso, desliga com a frase certa.
+async function atualizarRaizAgora() {
+  if (!rcloneProc || mountState.status !== 'mounted') return;
+  const motivo = await conferirSessao();
+  if (motivo && motivo.tipo === 'sem_acesso') { desligarComMotivo(motivo); return; }
+  if (!rcloneProc) return;
+  await rcCall('vfs/refresh', { recursive: 'false' });
+  pinLog('raiz: lista de coleções relida do servidor');
+}
+const atualizadorDaRaiz = Regras.criarAtualizadorDaRaiz({ atualizar: atualizarRaizAgora });
 
 // ══════════════════════════════════════════════════════════════════════
 // FIXAR PASTAS (pin) — mantém uma pasta sempre baixada no computador, pra
@@ -672,6 +717,11 @@ function handleRcloneLog(text) {
     if (!line.trim()) continue;
     if (/\b423\b|Locked/i.test(line)) {
       toast('warn', 'Um arquivo está em uso por outra pessoa — sua alteração não foi salva no servidor. Feche sem salvar.');
+    } else if (Regras.linhaDeAcessoRecusado(line)) {
+      // 401 do gateway: a credencial deixou de valer (autorização retirada,
+      // freelancer, empresa em saída, pessoa desativada ou credencial vencida).
+      // Não mostra o erro técnico: confere o acesso e diz a frase certa.
+      aoVerAcessoRecusado();
     } else if (/ERROR/i.test(line) &&
                !/symlinks not supported|ListJSON|directory not found|context canceled|operations\/list|502|Bad Gateway/i.test(line)) {
       // Erros de listagem/timeout são ruído da sondagem do pin — não alarmam.
@@ -680,28 +730,100 @@ function handleRcloneLog(text) {
   }
 }
 
-// Reusa a credencial guardada se ainda válida (folga de 7 dias); senão gera
-// uma nova e guarda. Evita criar uma credencial a cada "Conectar".
+// Pergunta ao gateway se a credencial ainda vale (PROPFIND da raiz, Depth 0).
+// 'recusada' só com 401 explícito; rede/servidor fora = 'desconhecido' (não
+// descarta nada por causa de um soluço).
+async function sondarCredencial(secret) {
+  if (!secret) return 'recusada';
+  try {
+    const res = await fetch(WEBDAV_URL + '/', {
+      method: 'PROPFIND',
+      headers: {
+        'Authorization': 'Basic ' + Buffer.from('abel-drive:' + secret).toString('base64'),
+        'Depth': '0',
+      },
+      signal: AbortSignal.timeout(15000),
+    });
+    try { await res.arrayBuffer(); } catch (_) {}
+    if (res.status === 401) return 'recusada';
+    return res.status < 500 ? 'ok' : 'desconhecido';
+  } catch (_) { return 'desconhecido'; }
+}
+
+// Reusa a credencial guardada se ainda válida (folga de 7 dias) e se o
+// gateway ainda a aceita; senão gera uma nova e guarda. Evita criar uma
+// credencial a cada "Conectar". Na recusa devolve o MOTIVO lido
+// (regras-do-drive): é ele que escolhe a frase da tela.
 async function getCredentialSecret() {
   const s = readStore();
   if (s.cred_secret && s.cred_expires) {
     const exp = new Date(s.cred_expires).getTime();
     if (isFinite(exp) && exp - Date.now() > 7 * 24 * 60 * 60 * 1000) {
-      return { ok: true, secret: s.cred_secret, reused: true };
+      const sonda = await sondarCredencial(s.cred_secret);
+      if (sonda !== 'recusada') return { ok: true, secret: s.cred_secret, reused: true };
+      // A guardada foi recusada (revogada, pessoa sem autorização...). Pede uma
+      // nova: a resposta diz o motivo exato.
+      pinLog('credencial guardada recusada pelo gateway (401) — pedindo uma nova');
+      writeStore({ cred_secret: null, cred_expires: null });
     }
   }
   const cred = await api('/mountain-duck/credentials', {
     method: 'POST', body: { label: 'Abel Drive' }, withSession: true,
   });
   if (!cred.ok || !cred.data || !cred.data.secret) {
-    // Distingue AUTH (401/403 → credencial/sessão inválida) de rede/transitório.
-    // Só auth deve zerar a credencial guardada; rede não.
-    const authFailed = cred._status === 401 || cred._status === 403;
-    return { ok: false, error: cred.error || 'erro', authFailed };
+    // NOT_AUTHORIZED, COLAB_SEM_DRIVE, EMPRESA_EM_SAIDA, sessão vencida, rede...
+    const motivo = Regras.lerMotivo({ error: cred.error, status: cred._status, message: cred.message });
+    return { ok: false, error: motivo.codigo, motivo, authFailed: !motivo.tentarDeNovo };
   }
   const expires = cred.data.credential && cred.data.credential.expires_at;
   writeStore({ cred_secret: cred.data.secret, cred_expires: expires || null });
   return { ok: true, secret: cred.data.secret, reused: false };
+}
+
+// Desliga o drive por falta de acesso (ou sessão vencida) e mostra a frase
+// certa. Descarta a credencial guardada e não tenta reconectar sozinho.
+let paradaComMotivo = null;   // lido no 'exit' do rclone
+function desligarComMotivo(motivo) {
+  pinLog('acesso recusado: ' + motivo.codigo);
+  if (motivo.zerarCredencial) {
+    writeStore({ cred_secret: null, cred_expires: null });
+    try { fs.unlinkSync(confPath()); } catch (_) {}
+  }
+  cancelReconnect();
+  if (rcloneProc) {
+    paradaComMotivo = motivo;
+    setMount({ status: 'disconnecting', message: 'Desconectando…' });
+    try { rcloneProc.kill(); } catch (_) {}
+  } else {
+    setMount({ status: 'error', mountPoint: null, message: motivo.frase, semAcesso: true });
+  }
+}
+
+// O rclone viu 401 com o drive montado. Uma conferência por minuto, no máximo
+// (o rclone repete o erro a cada pasta).
+let ultimaConferencia401 = 0;
+function aoVerAcessoRecusado() {
+  const agora = Date.now();
+  if (agora - ultimaConferencia401 < 60000) return;
+  ultimaConferencia401 = agora;
+  conferirCredencialNoAr().catch(() => {});
+}
+async function conferirCredencialNoAr() {
+  if (!rcloneProc || mountState.status !== 'mounted') return;
+  if ((await sondarCredencial(readStore().cred_secret)) !== 'recusada') return;
+  const daSessao = await conferirSessao();
+  if (daSessao && daSessao.tipo === 'sem_acesso') { desligarComMotivo(daSessao); return; }
+  writeStore({ cred_secret: null, cred_expires: null });
+  const c = await getCredentialSecret();
+  if (!c.ok) {
+    if (!c.motivo.tentarDeNovo) desligarComMotivo(c.motivo);
+    return;
+  }
+  // Credencial nova (a velha venceu ou foi revogada pela própria pessoa):
+  // apaga o conf e derruba o rclone; a reconexão normal regrava e remonta.
+  pinLog('credencial nova gerada com o drive montado — remontando');
+  try { fs.unlinkSync(confPath()); } catch (_) {}
+  if (rcloneProc) { try { rcloneProc.kill(); } catch (_) {} }
 }
 
 // Cancela qualquer reconexão pendente e zera o contador (saída intencional,
@@ -748,23 +870,29 @@ async function driveConnect(opts) {
   // Numa reconexão a credencial e o cache já existem; só num disparo manual/auto
   // limpamos o backoff pendente pra recomeçar do zero.
   if (!opts || !opts.reconnecting) cancelReconnect();
-  setMount({ status: 'connecting', message: 'Pegando sua credencial…' });
+  setMount({ status: 'connecting', message: 'Conferindo seu acesso…', semAcesso: false });
   // Começa um log limpo por sessão (pra capturar erros do mount).
   try { fs.writeFileSync(logFilePath(), '=== Abel Drive — sessão ' + new Date().toISOString() + ' ===\n'); } catch (_) {}
 
+  // 1º a sessão: pessoa desativada ou empresa em saída param aqui, com a
+  // frase certa (e o papel fica guardado para a bandeja).
+  const daSessao = await conferirSessao();
+  if (daSessao && daSessao.tipo === 'sem_acesso') {
+    desligarComMotivo(daSessao);
+    return { ...mountState, _authFailed: true };
+  }
+
+  setMount({ status: 'connecting', message: 'Pegando sua credencial…' });
   const c = await getCredentialSecret();
   if (!c.ok) {
     if (c.authFailed) {
-      // AUTENTICAÇÃO falhou (401/403): agora sim a credencial guardada não vale.
-      // Zera pra gerar uma nova no próximo "Conectar" e para o loop de reconexão.
-      writeStore({ cred_secret: null, cred_expires: null });
-      cancelReconnect();
-      setMount({ status: 'error', mountPoint: null,
-        message: 'Sua credencial expirou. Clique em Conectar para entrar de novo.' });
+      // Recusa (sem autorização, freelancer, empresa em saída, sessão vencida):
+      // frase do motivo, descarta a credencial e para o loop de reconexão.
+      desligarComMotivo(c.motivo);
       return { ...mountState, _authFailed: true };
     }
     // Rede/transitório: mantém a credencial; runReconnect reagenda com backoff.
-    setMount({ status: 'error', message: 'Não consegui a credencial (' + c.error + ').' });
+    setMount({ status: 'error', message: c.motivo.frase });
     return mountState;
   }
 
@@ -841,9 +969,17 @@ async function driveConnect(opts) {
     stopSyncPoll();
     stopPinLoop();
     stopChangesPoll();
+    atualizadorDaRaiz.parar();
     rcAddr = null; rcAuth = null;
-    if (wasIntentional || isQuitting) {
+    if (paradaComMotivo && !isQuitting) {
+      // Desligado por falta de acesso: fica a frase do motivo, sem reconectar.
+      const motivo = paradaComMotivo;
+      paradaComMotivo = null;
+      cancelReconnect();
+      setMount({ status: 'error', mountPoint: null, message: motivo.frase, semAcesso: true });
+    } else if (wasIntentional || isQuitting) {
       // Saída a pedido (Desconectar) ou app fechando → nada de reconectar.
+      paradaComMotivo = null;
       cancelReconnect();
       setMount({ status: 'idle', mountPoint: null, message: '' });
     } else {
@@ -870,6 +1006,7 @@ async function driveConnect(opts) {
       refreshPinnedDirs(); // e pré-aquece a listagem delas (navegar = instantâneo)
       startPinLoop();      // re-aquece periodicamente
       startChangesPoll();  // auto-refresh: arquivo novo do colega aparece sozinho
+      atualizadorDaRaiz.iniciar(); // lista de coleções relida a cada 5 min
     }
   }, 3500);
 
@@ -1089,7 +1226,10 @@ async function syncDownload(displayPath, manifest, { prune = false, protectAfter
 
 // Fluxo "Deixar um livro no computador" (bandeja): escolher pasta no drive →
 // medir → checar disco → confirmar → baixar.
+function podeSincronizar() { return Regras.podeVerSincronizacao(readStore().role); }
+
 async function syncAddFlow() {
+  if (!podeSincronizar()) return;   // o menu nem aparece fora do ADMIN/SUPER
   const mp = mountState.mountPoint;
   if (!mp || mountState.status !== 'mounted') { dialog.showMessageBox({ type: 'info', message: 'Conecte o drive primeiro pra escolher um livro.' }); return; }
   if (syncBusy) { dialog.showMessageBox({ type: 'info', message: 'Já estou baixando um livro. Espere terminar.' }); return; }
@@ -1276,7 +1416,7 @@ async function syncPushEdits(entry) {
 // Atualizador: mantém os livros baixados em dia (usa o /changes; re-baixa só o
 // que mudou e apaga o que sumiu). Um por vez, sem atrapalhar um download manual.
 async function syncUpdaterTick() {
-  if (syncBusy) return;
+  if (syncBusy || !podeSincronizar()) return;
   const list = readStore().synced || [];
   for (const entry of list) {
     if (syncBusy) break;
@@ -1318,8 +1458,27 @@ function buildSyncedItems() {
   }));
 }
 
-ipcMain.handle('sync:list', () => ({ synced: readStore().synced || [], progress: syncProgress }));
+ipcMain.handle('sync:list', () => (podeSincronizar()
+  ? { synced: readStore().synced || [], progress: syncProgress }
+  : { synced: [], progress: null }));
 ipcMain.handle('sync:add', () => syncAddFlow());
+
+// Itens da sincronização na bandeja: só ADMIN/SUPER, marcados como experimental.
+function trayItensDaSincronizacao(mounted) {
+  const itens = Regras.itensDaSincronizacao({ papel: readStore().role, montado: mounted, baixando: syncBusy });
+  if (itens.length === 0) return [];
+  const acoes = {
+    deixar: (it) => ({ label: it.label, enabled: it.enabled, click: () => syncAddFlow() }),
+    livros: (it) => ({ label: it.label, submenu: buildSyncedItems() }),
+    enviar: (it) => ({ label: it.label, type: 'checkbox', checked: readStore().syncUpload !== false,
+      click: (item) => writeStore({ syncUpload: item.checked }) }),
+  };
+  return [
+    ...(syncProgress ? [{ label: 'Baixando ' + syncProgressLine(), enabled: false }] : []),
+    ...itens.map((it) => acoes[it.id](it)),
+    { type: 'separator' },
+  ];
+}
 
 // ══════════════════════════════════════════════════════════════════════
 // BANDEJA (system tray) + auto-conectar + iniciar com o Windows
@@ -1349,11 +1508,7 @@ function buildTrayMenu() {
       ? { label: 'Desconectar', click: () => driveDisconnect() }
       : { label: busy ? (st === 'reconnecting' ? 'Reconectando…' : 'Conectando…') : 'Conectar meu drive', enabled: !busy, click: () => driveConnect() },
     { type: 'separator' },
-    ...(syncProgress ? [{ label: 'Baixando ' + syncProgressLine(), enabled: false }] : []),
-    { label: 'Deixar um livro no computador…', enabled: mounted && !syncBusy, click: () => syncAddFlow() },
-    { label: 'Livros no computador', submenu: buildSyncedItems() },
-    { label: 'Enviar minhas edições automaticamente', type: 'checkbox', checked: readStore().syncUpload !== false, click: (item) => writeStore({ syncUpload: item.checked }) },
-    { type: 'separator' },
+    ...trayItensDaSincronizacao(mounted),
     { label: 'Iniciar com o Windows', type: 'checkbox', checked: openAtLogin,
       click: (item) => app.setLoginItemSettings({ openAtLogin: item.checked }) },
     { type: 'separator' },
@@ -1479,7 +1634,11 @@ app.whenReady().then(() => {
   try {
     if (powerMonitor && typeof powerMonitor.on === 'function') {
       powerMonitor.on('resume', () => {
-        if (isQuitting || rcloneProc) return;
+        if (isQuitting) return;
+        // Montado: relê a lista de coleções agora (pode ter mudado no sono).
+        if (rcloneProc) { if (mountState.status === 'mounted') atualizadorDaRaiz.agora(); return; }
+        // Sem acesso não é rede: não adianta tentar de novo a cada acordar.
+        if (mountState.semAcesso) return;
         if (mountState.status === 'reconnecting' || mountState.status === 'error') {
           if (reconnectTimer) { clearTimeout(reconnectTimer); reconnectTimer = null; }
           reconnectAttempt = 0;
