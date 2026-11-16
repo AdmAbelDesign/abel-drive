@@ -10,7 +10,8 @@
 # igual ao build-mac.sh. O bin/rclone commitado (só Intel) é trocado só dentro
 # da máquina do run; nada volta para o git.
 #
-# Para trocar a versão do rclone: mude RCLONE_VERSION e as duas somas, copiadas
+# (Nada de variável com prefixo RCLONE_: o rclone lê como opção dele.)
+# Para trocar a versão do rclone: mude VERSAO_DO_RCLONE e as duas somas, copiadas
 # de https://downloads.rclone.org/<versão>/SHA256SUMS (linhas osx-amd64 e osx-arm64).
 
 name: Instalador Mac
@@ -32,9 +33,9 @@ jobs:
     runs-on: macos-latest
     timeout-minutes: 45
     env:
-      RCLONE_VERSION: v1.74.4 # mesma do bin/rclone.exe do Windows
-      RCLONE_SHA256_AMD64: 4188aa84043d7a6240912923f47639a9d2da21f3b40a521c065c8d92e66563f6
-      RCLONE_SHA256_ARM64: c2100e2d4a4b3be04c55cd45380cafe7647e1ad772bb055f52f00876ed701167
+      VERSAO_DO_RCLONE: v1.74.4 # mesma do bin/rclone.exe do Windows
+      SOMA_RCLONE_AMD64: 4188aa84043d7a6240912923f47639a9d2da21f3b40a521c065c8d92e66563f6
+      SOMA_RCLONE_ARM64: c2100e2d4a4b3be04c55cd45380cafe7647e1ad772bb055f52f00876ed701167
       CSC_IDENTITY_AUTO_DISCOVERY: "false" # sem assinatura
     steps:
       - uses: actions/checkout@v4
@@ -61,11 +62,11 @@ jobs:
           cd "$work"
           for arch in amd64 arm64; do
             curl -fsSL --retry 3 -o "rclone-$arch.zip" \
-              "https://downloads.rclone.org/$RCLONE_VERSION/rclone-$RCLONE_VERSION-osx-$arch.zip"
+              "https://downloads.rclone.org/$VERSAO_DO_RCLONE/rclone-$VERSAO_DO_RCLONE-osx-$arch.zip"
           done
           printf '%s  %s\n%s  %s\n' \
-            "$RCLONE_SHA256_AMD64" rclone-amd64.zip \
-            "$RCLONE_SHA256_ARM64" rclone-arm64.zip | shasum -a 256 -c -
+            "$SOMA_RCLONE_AMD64" rclone-amd64.zip \
+            "$SOMA_RCLONE_ARM64" rclone-arm64.zip | shasum -a 256 -c -
           unzip -q rclone-amd64.zip -d amd64
           unzip -q rclone-arm64.zip -d arm64
           lipo -create amd64/*/rclone arm64/*/rclone -output "$GITHUB_WORKSPACE/bin/rclone"
