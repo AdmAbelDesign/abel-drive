@@ -1,0 +1,88 @@
+# Instalador Mac do Abel Drive (.dmg + .zip, universal: Intel e Apple Silicon).
+#
+# Roda numa máquina macOS do GitHub, sem precisar de Mac local. Gera os
+# arquivos e deixa como ARTEFATO do run (aba Actions > o run > Artifacts).
+# NÃO cria release, NÃO publica nada, NÃO assina nem notariza (sem certificado,
+# sem segredos). O build de Windows não passa por aqui.
+#
+# rclone: baixado do site oficial (downloads.rclone.org), versão fixa e soma
+# SHA-256 conferida. As duas arquiteturas viram um binário universal (lipo),
+# igual ao build-mac.sh. O bin/rclone commitado (só Intel) é trocado só dentro
+# da máquina do run; nada volta para o git.
+#
+# Para trocar a versão do rclone: mude RCLONE_VERSION e as duas somas, copiadas
+# de https://downloads.rclone.org/<versão>/SHA256SUMS (linhas osx-amd64 e osx-arm64).
+
+name: Instalador Mac
+
+on:
+  push:
+    branches: [main]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: instalador-mac-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  mac:
+    runs-on: macos-latest
+    timeout-minutes: 45
+    env:
+      RCLONE_VERSION: v1.74.4 # mesma do bin/rclone.exe do Windows
+      RCLONE_SHA256_AMD64: 4188aa84043d7a6240912923f47639a9d2da21f3b40a521c065c8d92e66563f6
+      RCLONE_SHA256_ARM64: c2100e2d4a4b3be04c55cd45380cafe7647e1ad772bb055f52f00876ed701167
+      CSC_IDENTITY_AUTO_DISCOVERY: "false" # sem assinatura
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22 # o npm test usa glob no node --test (Node 21+)
+          cache: npm
+
+      - name: Instalar dependências
+        run: npm ci
+
+      - name: Testes
+        run: npm test
+
+      - name: Lint
+        run: npm run lint
+
+      - name: rclone universal (oficial, soma conferida)
+        run: |
+          set -euo pipefail
+          work="$RUNNER_TEMP/rclone"
+          mkdir -p "$work"
+          cd "$work"
+          for arch in amd64 arm64; do
+            curl -fsSL --retry 3 -o "rclone-$arch.zip" \
+              "https://downloads.rclone.org/$RCLONE_VERSION/rclone-$RCLONE_VERSION-osx-$arch.zip"
+          done
+          printf '%s  %s\n%s  %s\n' \
+            "$RCLONE_SHA256_AMD64" rclone-amd64.zip \
+            "$RCLONE_SHA256_ARM64" rclone-arm64.zip | shasum -a 256 -c -
+          unzip -q rclone-amd64.zip -d amd64
+          unzip -q rclone-arm64.zip -d arm64
+          lipo -create amd64/*/rclone arm64/*/rclone -output "$GITHUB_WORKSPACE/bin/rclone"
+          chmod +x "$GITHUB_WORKSPACE/bin/rclone"
+          lipo -info "$GITHUB_WORKSPACE/bin/rclone"
+          lipo "$GITHUB_WORKSPACE/bin/rclone" -verify_arch x86_64 arm64
+          "$GITHUB_WORKSPACE/bin/rclone" version | head -1
+
+      - name: Gerar .dmg e .zip (universal, sem publicar)
+        run: npx electron-builder --mac --universal --publish never
+
+      - name: Guardar como artefato do run
+        uses: actions/upload-artifact@v4
+        with:
+          name: Abel-Drive-mac-${{ github.run_number }}
+          path: |
+            dist/*.dmg
+            dist/*.zip
+          if-no-files-found: error
+          retention-days: 30

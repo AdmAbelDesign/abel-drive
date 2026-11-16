@@ -103,6 +103,21 @@ arquivo real do acervo num teste.
    os três arquivos (`.exe`, `.exe.blockmap`, `latest.yml`) e **Publish release**.
    O app instalado procura atualização ao abrir e baixa sozinho.
 
+## Instalador Mac pelo GitHub (sem Mac local)
+
+O workflow `.github/workflows/instalador-mac.yml` gera o `.dmg` e o `.zip`
+universais (Intel e Apple Silicon) numa máquina macOS do GitHub a cada push na
+main, ou pelo botão **Run workflow** (Actions › Instalador Mac). Baixa o rclone
+oficial (versão fixa, soma conferida), roda `npm test` e `npm run lint`. Não
+cria release nem publica nada.
+
+- **Baixar:** GitHub › Actions › Instalador Mac › o run verde › **Artifacts** ›
+  `Abel-Drive-mac-<n>` (um .zip com o `.dmg` e o `.zip` dentro; fica 30 dias).
+- **No Mac, antes de abrir:** instalar o **FUSE-T** (https://www.fuse-t.org).
+  Sem ele o app avisa e não monta.
+- **Primeira vez:** o app não tem assinatura, então abra com **clique direito ›
+  Abrir** (e confirme). Depois abre normal.
+
 ## Versões
 
 - **0.1.27** (08/10/2026): sincronização só para ADMIN, marcada como experimental;
